@@ -86,6 +86,7 @@ echo "!includedir /etc/mysql/group-replication.conf.d/" >>/etc/mysql/my.cnf
 
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
+default-authentication-plugin=mysql_native_password
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
 
 # General replication settings
