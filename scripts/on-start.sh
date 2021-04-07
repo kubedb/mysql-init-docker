@@ -7,7 +7,6 @@
 #   GROUP_NAME          = a uuid treated as the name of the replication group
 #   DB_NAME             = name of the database CR
 #   BASE_NAME           = name of the StatefulSet (same as the name of CRD)
-#   BASE_SERVER_ID      = server-id of the primary member
 #   GOV_SVC             = the name of the governing service
 #   POD_NAMESPACE       = the Pods' namespace
 #   MYSQL_ROOT_USERNAME = root user name
@@ -28,18 +27,33 @@ function log() {
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
 
+function check_ipv6() {
+    # https://snipplr.com/view/43003/regex--match-ipv6-address
+    # https://stackoverflow.com/questions/53497/regular-expression-that-matches-valid-ipv6-addresses
+    regex='^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$'
+    local ip="$1"
+    export is_ipv6=0
+    if [[ $ip =~ $regex ]]; then
+        is_ipv6=1
+    fi
+}
+
 # get the host names from stdin sent by peer-finder program
 cur_hostname=$(hostname)
 export cur_host=
 log "INFO" "Reading standard input..."
 while read -ra line; do
     if [[ "${line}" == *"${cur_hostname}"* ]]; then
-        #    cur_host="$line"
+        # cur_host will be set if the line holds DNS, otherwise cur_host will be set empty
         cur_host=$(echo -n ${line} | sed -e "s/.svc.cluster.local//g")
         log "INFO" "I am $cur_host"
     fi
     #  peers=("${peers[@]}" "$line")
     tmp=$(echo -n ${line} | sed -e "s/.svc.cluster.local//g")
+    check_ipv6 $tmp
+    if [[ "$is_ipv6" == "1" ]]; then
+        tmp="[$tmp]"
+    fi
     peers=("${peers[@]}" "$tmp")
 
 done
@@ -71,12 +85,29 @@ export cur_addr="${cur_host}:33061"
 # Get ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
-#
-# Command $(hostname -I) returns a space separated IP list. We need only the first one.
-myips=$(hostname -I)
-first=${myips%% *}
-# Now use this IP with CIDR notation
-export whitelist="${first}/8"
+# use this IP with CIDR notation
+export whitelist="${cur_host}/8"
+
+export localhost="127.0.0.1"
+
+# Command $(hostname -I) returns a space separated IP list.
+# host ip's array
+host_ips=($(hostname -I))
+for host_ip in ${host_ips[*]}; do
+    for ip in ${peers[*]}; do
+        if [[ ${host_ip} == *${ip}* ]]; then
+            cur_host="${host_ip}"
+            whitelist="${cur_host}/8"
+            cur_addr="${cur_host}:33061"
+            check_ipv6 $cur_host
+            if [[ "$is_ipv6" == "1" ]]; then
+                localhost="::1"
+                whitelist="${cur_host}/112"
+                cur_addr="[${cur_host}]:33061"
+            fi
+        fi
+    done
+done
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
@@ -120,7 +151,8 @@ loose-group_replication_group_seeds = "${seeds}"
 # Host specific replication configuration
 server_id = ${svr_id}
 #bind-address = "${cur_host}"
-bind-address = "0.0.0.0"
+#bind-address = "0.0.0.0"
+bind-address = *
 report_host = "${cur_host}"
 loose-group_replication_local_address = "${cur_addr}"
 EOL
@@ -155,7 +187,7 @@ function retry {
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     for i in {900..0}; do
         out=$(mysql -N -e "select 1;" 2>/dev/null)
@@ -183,7 +215,7 @@ function create_replication_user() {
     # 02. https://dev.mysql.com/doc/refman/8.0/en/group-replication-secure-user.html
     # 03. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
     log "INFO" "Checking whether replication user exist or not......"
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
@@ -205,7 +237,7 @@ function create_replication_user() {
 
 function install_group_replication_plugin() {
     log "INFO" "Checking whether replication plugin is installed or not....."
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
@@ -308,7 +340,7 @@ function bootstrap_cluster() {
     # - start group replication
     # - set global variable group_replication_bootstrap_group to `OFF`
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
     log "INFO" "bootstrapping cluster with host $cur_host..."
     if [[ "$joining_for_first_time" == "1" ]]; then
         retry 120 ${mysql} -N -e "RESET MASTER;"
@@ -321,7 +353,7 @@ function bootstrap_cluster() {
 function join_into_cluster() {
     # member try to join into the existing group
     log "INFO" "The replica, ${cur_host} is joining into the existing group..."
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     if [[ "$joining_for_first_time" == "1" ]]; then
@@ -338,9 +370,9 @@ function join_into_cluster() {
 # this is to bypass the warning message for using password
 export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
-export member_hosts=$(echo -n ${hosts} | sed -e "s/,/ /g")
+export member_hosts=($(echo -n ${peers[*]} | tr -d '[]'))
 export joining_for_first_time=0
-log "INFO" "Host lists: $member_hosts"
+log "INFO" "Host lists: ${member_hosts[@]}"
 
 # wait for mysqld to be ready
 wait_for_mysqld_running
