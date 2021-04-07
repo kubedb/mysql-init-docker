@@ -88,6 +88,8 @@ export cur_addr="${cur_host}:33061"
 # use this IP with CIDR notation
 export whitelist="${cur_host}/8"
 
+export localhost="127.0.0.1"
+
 # Command $(hostname -I) returns a space separated IP list.
 # host ip's array
 host_ips=($(hostname -I))
@@ -99,6 +101,7 @@ for host_ip in ${host_ips[*]}; do
             cur_addr="${cur_host}:33061"
             check_ipv6 $cur_host
             if [[ "$is_ipv6" == "1" ]]; then
+                localhost="::1"
                 whitelist="${cur_host}/112"
                 cur_addr="[${cur_host}]:33061"
             fi
@@ -184,7 +187,7 @@ function retry {
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     for i in {900..0}; do
         out=$(mysql -N -e "select 1;" 2>/dev/null)
@@ -212,7 +215,7 @@ function create_replication_user() {
     # 02. https://dev.mysql.com/doc/refman/8.0/en/group-replication-secure-user.html
     # 03. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
     log "INFO" "Checking whether replication user exist or not......"
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
@@ -239,7 +242,7 @@ function create_replication_user() {
 
 function install_group_replication_plugin() {
     log "INFO" "Checking whether replication plugin is installed or not....."
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
@@ -258,7 +261,7 @@ function install_group_replication_plugin() {
 
 function install_clone_plugin() {
     log "INFO" "Checking whether clone plugin is installed or not...."
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep clone
@@ -357,7 +360,7 @@ function wait_for_primary() {
 declare -a donors
 function set_valid_donors() {
     log "INFO" "Checking whether valid donor is found or not. If found, set this to 'clone_valid_donor_list'"
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
     # clone process run when the donor and recipient must have the same MySQL server version and
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=The%20clone%20plugin%20is%20supported,17%20and%20higher.&text=The%20donor%20and%20recipient%20MySQL%20server%20instances%20must%20run,same%20operating%20system%20and%20platform.
     cur_host_version=$(${mysql} -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
@@ -404,7 +407,7 @@ function bootstrap_cluster() {
     # - start group replication
     # - set global variable group_replication_bootstrap_group to `OFF`
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
     log "INFO" "bootstrapping cluster with host $cur_host..."
     if [[ "$joining_for_first_time" == "1" ]]; then
         retry 120 ${mysql} -N -e "RESET MASTER;"
@@ -417,7 +420,7 @@ function bootstrap_cluster() {
 function join_into_cluster() {
     # member try to join into the existing group
     log "INFO" "The replica, ${cur_host} is joining into the existing group..."
-    local mysql="$mysql_header --host=127.0.0.1"
+    local mysql="$mysql_header --host=$localhost"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
@@ -427,7 +430,7 @@ function join_into_cluster() {
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
-        if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 5 ]]; then
+        if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $cur_host....."
                 error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
