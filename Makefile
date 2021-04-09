@@ -12,12 +12,14 @@ push: container
 
 .PHONY: container
 container:
-	wget -qO peer-finder https://github.com/kmodules/peer-finder/releases/download/v1.0.1-ac/peer-finder
+	curl -fsSL -O https://github.com/kmodules/peer-finder/releases/download/v1.1.0/peer-finder-linux-amd64.tar.gz
+	tar -xzvf peer-finder-linux-amd64.tar.gz
+	mv peer-finder-linux-amd64 peer-finder
 	chmod +x peer-finder
 	chmod +x init-script/run.sh
 	find $$(pwd)/scripts -type f -exec chmod +x {} \;
 	docker build --pull -t $(IMAGE):$(TAG) .
-	rm peer-finder
+	rm peer-finder peer-finder-linux-amd64.tar.gz
 
 .PHONY: version
 version:
