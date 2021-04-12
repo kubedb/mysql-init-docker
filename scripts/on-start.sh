@@ -27,17 +27,6 @@ function log() {
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
 
-function check_ipv6() {
-    # https://snipplr.com/view/43003/regex--match-ipv6-address
-    # https://stackoverflow.com/questions/53497/regular-expression-that-matches-valid-ipv6-addresses
-    regex='^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$'
-    local ip="$1"
-    export is_ipv6=0
-    if [[ $ip =~ $regex ]]; then
-        is_ipv6=1
-    fi
-}
-
 # get the host names from stdin sent by peer-finder program
 cur_hostname=$(hostname)
 export cur_host=
@@ -50,10 +39,6 @@ while read -ra line; do
     fi
     #  peers=("${peers[@]}" "$line")
     tmp=$(echo -n ${line} | sed -e "s/.svc.cluster.local//g")
-    check_ipv6 $tmp
-    if [[ "$is_ipv6" == "1" ]]; then
-        tmp="[$tmp]"
-    fi
     peers=("${peers[@]}" "$tmp")
 
 done
@@ -82,29 +67,25 @@ declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
 export cur_addr="${cur_host}:33061"
 
-# Get ip_whitelist
-# https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
-# https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
-# use this IP with CIDR notation
-export whitelist="${cur_host}/8"
-
-export localhost="127.0.0.1"
-
 # Command $(hostname -I) returns a space separated IP list.
 # host ip's array
 host_ips=($(hostname -I))
+first=${host_ips%% *}
+
+export localhost="127.0.0.1"
+
+# Get ip_whitelist
+# https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
+# https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
+# Now use this IP with CIDR notation
+export whitelist="${first}/24"
+
 for host_ip in ${host_ips[*]}; do
     for ip in ${peers[*]}; do
         if [[ ${host_ip} == *${ip}* ]]; then
             cur_host="${host_ip}"
-            whitelist="${cur_host}/8"
             cur_addr="${cur_host}:33061"
-            check_ipv6 $cur_host
-            if [[ "$is_ipv6" == "1" ]]; then
-                localhost="::1"
-                whitelist="${cur_host}/112"
-                cur_addr="[${cur_host}]:33061"
-            fi
+            break;
         fi
     done
 done
@@ -150,8 +131,7 @@ loose-group_replication_group_seeds = "${seeds}"
 # Host specific replication configuration
 server_id = ${svr_id}
 #bind-address = "${cur_host}"
-#bind-address = "0.0.0.0"
-bind-address = *
+bind-address = "0.0.0.0"
 report_host = "${cur_host}"
 loose-group_replication_local_address = "${cur_addr}"
 EOL
@@ -369,7 +349,7 @@ function join_into_cluster() {
 # this is to bypass the warning message for using password
 export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
-export member_hosts=($(echo -n ${peers[*]} | tr -d '[]'))
+export member_hosts=$(echo -n ${hosts} | sed -e "s/,/ /g")
 export joining_for_first_time=0
 log "INFO" "Host lists: ${member_hosts[@]}"
 
