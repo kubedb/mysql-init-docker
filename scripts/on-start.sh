@@ -11,13 +11,12 @@
 #   POD_NAMESPACE       = the Pods' namespace
 #   MYSQL_ROOT_USERNAME = root user name
 #   MYSQL_ROOT_PASSWORD = root password
+#   HOST_ADDRESS        = Address used to communicate among the peers. This can be fully qualified host name or IPv4 or IPv6
+#   HOST_ADDRESS_TYPE   = Address type of HOST_ADDRESS (one of DNS, IPV4, IPv6)
+#   POD_IP              = IP address used to create whitelist CIDR. For HOST_ADDRESS_TYPE=DNS, it will be status.PodIP.
+#   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
 
-#   HOST_ADDRESS
-#   HOST_ADDRESS_TYPE
-#   POD_IP
-#   POD_IP_TYPE
-
-env | sort
+env | sort | grep "POD\|HOST\|NAME"
 
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
