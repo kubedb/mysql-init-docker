@@ -11,6 +11,18 @@
 #   POD_NAMESPACE       = the Pods' namespace
 #   MYSQL_ROOT_USERNAME = root user name
 #   MYSQL_ROOT_PASSWORD = root password
+#   HOST_ADDRESS        = Address used to communicate among the peers. This can be fully qualified host name or IPv4 or IPv6
+#   HOST_ADDRESS_TYPE   = Address type of HOST_ADDRESS (one of DNS, IPV4, IPv6)
+#   POD_IP              = IP address used to create whitelist CIDR. For HOST_ADDRESS_TYPE=DNS, it will be status.PodIP.
+#   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
+
+env | sort | grep "POD\|HOST\|NAME"
+
+if [ "$POD_IP_TYPE" = "IPv6" ]; then
+    log "ERROR" "MySQL 5.7 is not supported on an IPv6 cluster."
+    log "ERROR" "See here for details: https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-permissions.html"
+    exit 1
+fi
 
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
@@ -28,17 +40,13 @@ function log() {
 }
 
 # get the host names from stdin sent by peer-finder program
-cur_hostname=$(hostname)
-export cur_host=
+
+cur_host=$(echo -n ${HOST_ADDRESS} | sed -e "s/.svc.cluster.local//g")
+log "INFO" "I am $cur_host"
+
 log "INFO" "Reading standard input..."
 while read -ra line; do
-    if [[ "${line}" == *"${cur_hostname}"* ]]; then
-        # cur_host will be set if the line holds DNS, otherwise cur_host will be set empty
-        cur_host=$(echo -n ${line} | sed -e "s/.svc.cluster.local//g")
-        log "INFO" "I am $cur_host"
-    fi
-    #  peers=("${peers[@]}" "$line")
-    tmp=$(echo -n ${line} | sed -e "s/.svc.cluster.local//g")
+    tmp=$(echo -n ${line[0]} | sed -e "s/.svc.cluster.local//g")
     peers=("${peers[@]}" "$tmp")
 
 done
@@ -52,7 +60,7 @@ export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
 export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 
-# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 232 − 1.
+# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 2^32 − 1.
 # “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
 # the server ID is calculated using the below formula:
@@ -65,30 +73,19 @@ fi
 declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
 declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
-export cur_addr="${cur_host}:33061"
+cur_addr="${cur_host}:33061"
 
-# Command $(hostname -I) returns a space separated IP list.
-# host ip's array
-host_ips=($(hostname -I))
-first=${host_ips%% *}
-
-export localhost="127.0.0.1"
+localhost="127.0.0.1"
 
 # Get ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
 # Now use this IP with CIDR notation
-export whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
+whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
+if [ -z "$whitelist" ]; then
+    whitelist="$POD_IP"/16
+fi
 
-for host_ip in ${host_ips[*]}; do
-    for ip in ${peers[*]}; do
-        if [[ ${host_ip} == *${ip}* ]]; then
-            cur_host="${host_ip}"
-            cur_addr="${cur_host}:33061"
-            break
-        fi
-    done
-done
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
