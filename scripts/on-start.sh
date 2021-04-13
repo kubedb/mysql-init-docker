@@ -82,29 +82,30 @@ declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
 export cur_addr="${cur_host}:33061"
 
-# Get ip_whitelist
-# https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
-# https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
-# use this IP with CIDR notation
-export whitelist="${cur_host}/8"
-
-export localhost="127.0.0.1"
-
 # Command $(hostname -I) returns a space separated IP list.
 # host ip's array
 host_ips=($(hostname -I))
+first=${host_ips%% *}
+
+export localhost="127.0.0.1"
+
+# Get ip_whitelist
+# https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
+# https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
+# Now use this IP with CIDR notation
+export whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
+
 for host_ip in ${host_ips[*]}; do
     for ip in ${peers[*]}; do
         if [[ ${host_ip} == *${ip}* ]]; then
             cur_host="${host_ip}"
-            whitelist="${cur_host}/8"
             cur_addr="${cur_host}:33061"
             check_ipv6 $cur_host
             if [[ "$is_ipv6" == "1" ]]; then
                 localhost="::1"
-                whitelist="${cur_host}/112"
                 cur_addr="[${cur_host}]:33061"
             fi
+            break
         fi
     done
 done
@@ -430,7 +431,7 @@ function join_into_cluster() {
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
-        if [[ $valid_donor_found == 1 ]] && [ $primary_db_size -ge 128 ]; then
+        if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $cur_host....."
                 error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
