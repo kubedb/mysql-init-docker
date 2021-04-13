@@ -78,14 +78,14 @@ export localhost="127.0.0.1"
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
 # Now use this IP with CIDR notation
-export whitelist="${first}/24"
+export whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
 
 for host_ip in ${host_ips[*]}; do
     for ip in ${peers[*]}; do
         if [[ ${host_ip} == *${ip}* ]]; then
             cur_host="${host_ip}"
             cur_addr="${cur_host}:33061"
-            break;
+            break
         fi
     done
 done
