@@ -17,6 +17,8 @@
 #   POD_IP
 #   POD_IP_TYPE
 
+env | sort
+
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
