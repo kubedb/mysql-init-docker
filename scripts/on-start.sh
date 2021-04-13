@@ -12,6 +12,11 @@
 #   MYSQL_ROOT_USERNAME = root user name
 #   MYSQL_ROOT_PASSWORD = root password
 
+#   HOST_ADDRESS
+#   HOST_ADDRESS_TYPE
+#   POD_IP
+#   POD_IP_TYPE
+
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
@@ -27,31 +32,15 @@ function log() {
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
 
-function check_ipv6() {
-    # https://snipplr.com/view/43003/regex--match-ipv6-address
-    # https://stackoverflow.com/questions/53497/regular-expression-that-matches-valid-ipv6-addresses
-    regex='^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$'
-    local ip="$1"
-    export is_ipv6=0
-    if [[ $ip =~ $regex ]]; then
-        is_ipv6=1
-    fi
-}
-
 # get the host names from stdin sent by peer-finder program
-cur_hostname=$(hostname)
-export cur_host=
+
+cur_host=$(echo -n ${HOST_ADDRESS} | sed -e "s/.svc.cluster.local//g")
+log "INFO" "I am $cur_host"
+
 log "INFO" "Reading standard input..."
 while read -ra line; do
-    if [[ "${line}" == *"${cur_hostname}"* ]]; then
-        # cur_host will be set if the line holds DNS, otherwise cur_host will be set empty
-        cur_host=$(echo -n ${line} | sed -e "s/.svc.cluster.local//g")
-        log "INFO" "I am $cur_host"
-    fi
-    #  peers=("${peers[@]}" "$line")
-    tmp=$(echo -n ${line} | sed -e "s/.svc.cluster.local//g")
-    check_ipv6 $tmp
-    if [[ "$is_ipv6" == "1" ]]; then
+    tmp=$(echo -n ${line[0]} | sed -e "s/.svc.cluster.local//g")
+    if [[ "$HOST_ADDRESS_TYPE" == "IPv6" ]]; then
         tmp="[$tmp]"
     fi
     peers=("${peers[@]}" "$tmp")
@@ -67,7 +56,7 @@ export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
 export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 
-# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 232 − 1.
+# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 2^32 − 1.
 # “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
 # the server ID is calculated using the below formula:
@@ -80,35 +69,29 @@ fi
 declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
 declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
-export cur_addr="${cur_host}:33061"
+cur_addr="${cur_host}:33061"
+if [[ "$HOST_ADDRESS_TYPE" == "IPv6" ]]; then
+    cur_addr="[${cur_host}]:33061"
+fi
 
-# Command $(hostname -I) returns a space separated IP list.
-# host ip's array
-host_ips=($(hostname -I))
-first=${host_ips%% *}
-
-export localhost="127.0.0.1"
+localhost="127.0.0.1"
+if [[ "$POD_IP_TYPE" == "IPv6" ]]; then
+    localhost="::1"
+fi
 
 # Get ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
 # Now use this IP with CIDR notation
-export whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
+whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
+if [ -z "$whitelist" ]; then
+    if [[ "$POD_IP_TYPE" == "IPv6" ]]; then
+        whitelist="$POD_IP"/64
+    else
+        whitelist="$POD_IP"/16
+    fi
+fi
 
-for host_ip in ${host_ips[*]}; do
-    for ip in ${peers[*]}; do
-        if [[ ${host_ip} == *${ip}* ]]; then
-            cur_host="${host_ip}"
-            cur_addr="${cur_host}:33061"
-            check_ipv6 $cur_host
-            if [[ "$is_ipv6" == "1" ]]; then
-                localhost="::1"
-                cur_addr="[${cur_host}]:33061"
-            fi
-            break
-        fi
-    done
-done
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
@@ -376,7 +359,8 @@ function set_valid_donors() {
         donor_version=$(${mysql_header} --host=$primary_host -N -e "SELECT MEMBER_VERSION FROM performance_schema.replication_group_members WHERE MEMBER_HOST = '${donor}';" | awk '{print $1}')
         if [[ "$cur_host_version" == "$donor_version" ]]; then
             local alias_found=0
-            while read line; do
+            # ref: https://linuxize.com/post/how-to-read-a-file-line-by-line-in-bash/#using-file-descriptor
+            while read -r -u9 line; do
                 local ip=$(echo $line | cut -d' ' -f 1)
                 if [[ "$donor" == "$ip" ]]; then
                     local alias=$(echo $line | cut -d' ' -f 2)
@@ -384,7 +368,7 @@ function set_valid_donors() {
                     alias_found=1
                     break
                 fi
-            done <'/etc/hosts'
+            done 9<'/etc/hosts'
             if [[ "$alias_found" == "0" ]]; then
                 donors=("${donors[@]}" "$donor")
             fi
