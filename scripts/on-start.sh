@@ -434,7 +434,9 @@ function join_into_cluster() {
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
+        echo " -------------valid donor --------$valid_donor_found   -------------primary_db_size---- $primary_db_size---------------------"
         if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
+          echo "-----------------------$donor{*}----------------------"
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $cur_host....."
                 error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
@@ -453,6 +455,7 @@ function join_into_cluster() {
                 for i in {120..0}; do
                     kill -0 $pid
                     exit="$?"
+                    echo "exit code ------------------$exit--------------------"
                     log "INFO" "Attempt $i: Checking mysqld(process id=$pid) is alive or not, exit code: $exit"
                     if [[ "$exit" != "0" ]]; then
                         mysqld_alive=0
@@ -474,6 +477,7 @@ function join_into_cluster() {
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
         log "INFO" "Host (${cur_host}) has joined to the group......."
     fi
+    echo "end join in cluster"
 }
 
 # create mysql client with user exported in mysql_header and export password

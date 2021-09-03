@@ -3,8 +3,8 @@ SHELL=/bin/bash -o pipefail
 REGISTRY ?= kubedb
 BIN      := mysql-init
 IMAGE    := $(REGISTRY)/$(BIN)
-TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "")
-
+#TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "") 8.0.21
+TAG := 8.0.21
 
 .PHONY: push
 push: container
@@ -25,6 +25,7 @@ container:
 	chmod +x tini
 	chmod +x init-script/run.sh
 	find $$(pwd)/scripts -type f -exec chmod +x {} \;
+	echo $(TAG)
 	docker build --pull -t $(IMAGE):$(TAG) .
 	rm tini
 

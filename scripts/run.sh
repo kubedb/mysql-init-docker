@@ -16,6 +16,7 @@
 
 echo "wating for sciripts"
 echo "--------------$@---------------"
+args=$@
 
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
@@ -346,12 +347,14 @@ function join_into_cluster() {
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
-    mysqld_alive=1
+    export mysqld_alive=1
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
-        if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
+        echo " -------------valid donor --------$valid_donor_found   -------------primary_db_size---- $primary_db_size---------------------"
+        if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 1 ]]; then
+          echo "-----------------------$donor{*}----------------------"
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $report_host....."
                 error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
@@ -370,6 +373,7 @@ function join_into_cluster() {
                 for i in {120..0}; do
                     kill -0 $pid
                     exit="$?"
+                    echo "exit code ------------------$exit--------------------"
                     log "INFO" "Attempt $i: Checking mysqld(process id=$pid) is alive or not, exit code: $exit"
                     if [[ "$exit" != "0" ]]; then
                         mysqld_alive=0
@@ -390,7 +394,20 @@ function join_into_cluster() {
     if [[ $mysqld_alive == 1 ]]; then
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
         log "INFO" "Host (${report_host}) has joined to the group......."
+        else
+        #run mysqld in background since mysqld can't restart after a clone process
+        log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
+        docker-entrypoint.sh mysqld $args &
+        pid=$!
+        log "INFO" "The process id of mysqld is '$pid'"
+        wait_for_mysqld_running
+        retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
+        log "INFO" "Host (${report_host}) has joined to the group......."
+        #
     fi
+
+
+    echo "end join in cluster"
 }
 
 # run the mysqld process in background with user provided arguments if any
@@ -437,6 +454,13 @@ if [[ $desired_func == "join_in_cluster" ]]; then
     wait_for_primary "${member_hosts[*]}"
     set_valid_donors
     join_into_cluster
+    echo "  mysqld alive $mysqld_alive"
+    if [[ "$mysqld_alive" == "0" ]] ;then
+      log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
+      docker-entrypoint.sh mysqld $@ &
+      pid=$!
+      log "INFO" "The process id of mysqld is '$pid'"
+    fi
 fi
-
+echo $pid
 wait $pid
