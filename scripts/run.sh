@@ -14,10 +14,8 @@
 #   POD_IP              = IP address used to create whitelist CIDR. For HOST_ADDRESS_TYPE=DNS, it will be status.PodIP.
 #   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
 
-echo "wating for sciripts"
-echo "--------------$@---------------"
+#holds all the args passed from statefulset
 args=$@
-
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
@@ -352,9 +350,8 @@ function join_into_cluster() {
         log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
-        echo " -------------valid donor --------$valid_donor_found   -------------primary_db_size---- $primary_db_size---------------------"
         if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 1 ]]; then
-          echo "-----------------------$donor{*}----------------------"
+            echo "-----------------------$donor{*}----------------------"
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $report_host....."
                 error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
@@ -394,7 +391,7 @@ function join_into_cluster() {
     if [[ $mysqld_alive == 1 ]]; then
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
         log "INFO" "Host (${report_host}) has joined to the group......."
-        else
+    else
         #run mysqld in background since mysqld can't restart after a clone process
         log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
         docker-entrypoint.sh mysqld $args &
@@ -405,7 +402,6 @@ function join_into_cluster() {
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
-
 
     echo "end join in cluster"
 }
@@ -446,7 +442,7 @@ done
 desired_func=$(cat /scripts/signal.txt)
 echo $desired_func
 if [[ $desired_func == "create_cluster" ]]; then
-   bootstrap_cluster
+    bootstrap_cluster
 fi
 
 if [[ $desired_func == "join_in_cluster" ]]; then
@@ -455,11 +451,11 @@ if [[ $desired_func == "join_in_cluster" ]]; then
     set_valid_donors
     join_into_cluster
     echo "  mysqld alive $mysqld_alive"
-    if [[ "$mysqld_alive" == "0" ]] ;then
-      log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-      docker-entrypoint.sh mysqld $@ &
-      pid=$!
-      log "INFO" "The process id of mysqld is '$pid'"
+    if [[ "$mysqld_alive" == "0" ]]; then
+        log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
+        docker-entrypoint.sh mysqld $@ &
+        pid=$!
+        log "INFO" "The process id of mysqld is '$pid'"
     fi
 fi
 echo $pid

@@ -436,7 +436,7 @@ function join_into_cluster() {
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
         echo " -------------valid donor --------$valid_donor_found   -------------primary_db_size---- $primary_db_size---------------------"
         if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
-          echo "-----------------------$donor{*}----------------------"
+            echo "-----------------------$donor{*}----------------------"
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $cur_host....."
                 error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
