@@ -405,13 +405,20 @@ function join_into_cluster() {
 
     echo "end join in cluster"
 }
-
+export pid
+function start_mysqld_in_background(){
+  log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
+    docker-entrypoint.sh mysqld $args &
+    pid=$!
+    log "INFO" "The process id of mysqld is '$pid'"
+}
 # run the mysqld process in background with user provided arguments if any
-log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-docker-entrypoint.sh mysqld $@ &
-
-pid=$!
-log "INFO" "The process id of mysqld is '$pid'"
+#log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
+#docker-entrypoint.sh mysqld $args &
+#pid=$!
+#log "INFO" "The process id of mysqld is '$pid'"
+start_mysqld_in_background
+echo "-------------------------------------------------pid = "$pid "-------------------------------"
 
 # create mysql client with user exported in mysql_header and export password
 # this is to bypass the warning message for using password
@@ -432,6 +439,57 @@ install_group_replication_plugin
 
 # ensure clone plugin
 install_clone_plugin
+
+#what do i want
+#if mysql process is not running then run mysql and wait
+#then wait for signal and run signal <create cluster or join in cluster>
+#wait for pid
+#if pid exit
+# then restart from the top
+
+# how do i achive that?
+
+while true; do
+    kill -0 $pid
+    exit="$?"
+    echo "exit code ------------------$exit--------------------"
+    if [[ "$exit" == "0" ]]; then
+        echo "mysqld process is running"
+    else
+        echo "need start mysqld and wait_for_mysqld_running"
+        start_mysqld_in_background
+    fi
+
+    # wait for the script copied by coordinator
+    while [ ! -f "/scripts/signal.txt" ]; do
+        log "WARNING" "signal is not present yet!"
+        sleep 1
+    done
+
+    desired_func=$(cat /scripts/signal.txt)
+    rm -rf scripts/signal.txt
+    echo $desired_func
+    if [[ $desired_func == "create_cluster" ]]; then
+        bootstrap_cluster
+    fi
+
+    if [[ $desired_func == "join_in_cluster" ]]; then
+        check_member_list_updated "${member_hosts[*]}"
+        wait_for_primary "${member_hosts[*]}"
+        set_valid_donors
+        join_into_cluster
+        echo "  mysqld alive $mysqld_alive"
+        if [[ "$mysqld_alive" == "0" ]]; then
+            log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
+            docker-entrypoint.sh mysqld $@ &
+            pid=$!
+            log "INFO" "The process id of mysqld is '$pid'"
+        fi
+    fi
+    echo $pid
+    wait $pid
+
+done
 
 # wait for the script copied by coordinator
 while [ ! -f "/scripts/signal.txt" ]; do
