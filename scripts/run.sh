@@ -104,7 +104,9 @@ loose-group_replication_recovery_use_ssl = 1
 
 # Shared replication group configuration
 loose-group_replication_group_name = "${GROUP_NAME}"
-loose-group_replication_ip_whitelist = "${hosts}"
+#loose-group_replication_ip_whitelist = "${hosts}"
+loose-group_replication_ip_whitelist = "AUTOMATIC"
+loose-group_replication_ip_allowlist = "AUTOMATIC"
 loose-group_replication_group_seeds = "${seeds}"
 
 # Single or Multi-primary mode? Uncomment these two lines
@@ -393,10 +395,7 @@ function join_into_cluster() {
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
-        log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-        docker-entrypoint.sh mysqld $args &
-        pid=$!
-        log "INFO" "The process id of mysqld is '$pid'"
+        start_mysqld_in_background
         wait_for_mysqld_running
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
         log "INFO" "Host (${report_host}) has joined to the group......."
@@ -406,8 +405,8 @@ function join_into_cluster() {
     echo "end join in cluster"
 }
 export pid
-function start_mysqld_in_background(){
-  log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
+function start_mysqld_in_background() {
+    log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
     docker-entrypoint.sh mysqld $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
@@ -458,6 +457,7 @@ while true; do
     else
         echo "need start mysqld and wait_for_mysqld_running"
         start_mysqld_in_background
+        wait_for_mysqld_running
     fi
 
     # wait for the script copied by coordinator
@@ -465,9 +465,8 @@ while true; do
         log "WARNING" "signal is not present yet!"
         sleep 1
     done
-
     desired_func=$(cat /scripts/signal.txt)
-    rm -rf scripts/signal.txt
+    rm -rf /scripts/signal.txt
     echo $desired_func
     if [[ $desired_func == "create_cluster" ]]; then
         bootstrap_cluster
@@ -479,42 +478,9 @@ while true; do
         set_valid_donors
         join_into_cluster
         echo "  mysqld alive $mysqld_alive"
-        if [[ "$mysqld_alive" == "0" ]]; then
-            log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-            docker-entrypoint.sh mysqld $@ &
-            pid=$!
-            log "INFO" "The process id of mysqld is '$pid'"
-        fi
     fi
     echo $pid
     wait $pid
+    sleep 11
 
 done
-
-# wait for the script copied by coordinator
-while [ ! -f "/scripts/signal.txt" ]; do
-    log "WARNING" "signal is not present yet!"
-    sleep 1
-done
-
-desired_func=$(cat /scripts/signal.txt)
-echo $desired_func
-if [[ $desired_func == "create_cluster" ]]; then
-    bootstrap_cluster
-fi
-
-if [[ $desired_func == "join_in_cluster" ]]; then
-    check_member_list_updated "${member_hosts[*]}"
-    wait_for_primary "${member_hosts[*]}"
-    set_valid_donors
-    join_into_cluster
-    echo "  mysqld alive $mysqld_alive"
-    if [[ "$mysqld_alive" == "0" ]]; then
-        log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-        docker-entrypoint.sh mysqld $@ &
-        pid=$!
-        log "INFO" "The process id of mysqld is '$pid'"
-    fi
-fi
-echo $pid
-wait $pid
