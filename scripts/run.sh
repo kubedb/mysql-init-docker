@@ -230,10 +230,9 @@ function bootstrap_cluster() {
         retry 120 ${mysql} -N -e "RESET MASTER;"
     fi
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
+    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
 }
-
 function check_member_list_updated() {
     for host in $@; do
         local mysql="$mysql_header --host=$host"
@@ -391,13 +390,13 @@ function join_into_cluster() {
     fi
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
+        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
+        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
