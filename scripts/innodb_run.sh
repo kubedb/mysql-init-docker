@@ -10,7 +10,8 @@ function log() {
     local msg="$2"
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
-#stores all the arguments that are passed form statefulset
+
+#stores all the arguments that are passed from statefulSet
 args=$@
 report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
 log "INFO" "report_host = $report_host"
@@ -95,6 +96,7 @@ function create_replication_user() {
 
     #retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
 }
+
 restart_required=0
 already_configured=0
 
@@ -123,24 +125,25 @@ function create_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${report_host}"
     retry 5 $mysqlshell -e "cluster=dba.createCluster('mycluster',{exitStateAction:'OFFLINE_MODE',autoRejoinTries:'2',consistency:'BEFORE_ON_PRIMARY_FAILOVER'});"
 }
-export  primary=""
-function select_primary() {
 
-    for host in "${peers[@]}"; do
-      echo  "-------------$host------------"
-        local mysqlshell="mysqlsh -u${replication_user} -h${host} -p${MYSQL_ROOT_PASSWORD}"
-        #result of the query output "member_host host_name" in this format
-        retry 240 $mysqlshell --sql -e "SELECT member_host FROM performance_schema.replication_group_members where member_role = 'PRIMARY' ;"
-        selected_primary=($($mysqlshell --sql -e "SELECT member_host FROM performance_schema.replication_group_members where member_role = 'PRIMARY' ;"))
-        echo "-----------------$select_primary----------"
-        if [[ "${#selected_primary[@]}" -ge "1" ]]; then
-            primary=${selected_primary[1]}
-            log "INFO" "Primary found $primary."
-            return
-        fi
+export primary=""
+function select_primary() {
+    for i in {900..0}; do
+        for host in "${peers[@]}"; do
+            local mysqlshell="mysqlsh -u${replication_user} -h${host} -p${MYSQL_ROOT_PASSWORD}"
+            #result of the query output "member_host host_name" in this format
+            #       $mysqlshell --sql -e "SELECT member_host FROM performance_schema.replication_group_members where member_role = 'PRIMARY' ;"
+            selected_primary=($($mysqlshell --sql -e "SELECT member_host FROM performance_schema.replication_group_members where member_role = 'PRIMARY' ;"))
+            if [[ "${#selected_primary[@]}" -ge "1" ]]; then
+                primary=${selected_primary[1]}
+                log "INFO" "Primary found $primary."
+                return
+            fi
+        done
     done
     log "INFO" "Primary not found."
 }
+
 already_in_cluster=0
 
 function is_already_in_cluster() {
@@ -156,28 +159,19 @@ function is_already_in_cluster() {
         fi
     done
 }
-function join_in_cluster() {
-#    log "INFO " "$report_host joining in cluster"
-#
-#    #cheking for instance can rejoin during a fail-over
-#    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
-#    ${mysqlshell} -e "cluster=dba.getCluster(); cluster.rejoinInstance('${replication_user}@${report_host}',{password:'${MYSQL_ROOT_PASSWORD}'})"
-#    ${mysqlshell} -e "cluster = dba.getCluster();  cluster.rescan({addInstances:['${report_host}:3306'],interactive:false})"
-#    wait_for_host_online "repl" "$report_host" "${MYSQL_ROOT_PASSWORD}"
-#    is_already_in_cluster
-#
-#    if [[ "$already_in_cluster" == "1" ]]; then
-#        wait $pid
-#    fi
-    #add a new instance
-    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
-    ${mysqlshell} -e "cluster = dba.getCluster();cluster.addInstance('${replication_user}@${report_host}',{password:'${MYSQL_ROOT_PASSWORD}',recoveryMethod:'incremental',exitStateAction:'OFFLINE_MODE'});"
 
+function join_in_cluster() {
+    log "INFO " "$report_host joining in cluster"
+    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    retry 10 ${mysqlshell} -e "cluster = dba.getCluster();cluster.addInstance('${replication_user}@${report_host}',{password:'${MYSQL_ROOT_PASSWORD}',recoveryMethod:'incremental',exitStateAction:'OFFLINE_MODE'});"
+
+    #this is required for clone method
     # Prevent creation of new process until this one is finished
     #https://serverfault.com/questions/477448/mysql-keeps-crashing-innodb-unable-to-lock-ibdata1-error-11
-    wait $pid
+    # wait $pid
 
 }
+
 joined_in_cluster=0
 function make_sure_instance_join_in_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
@@ -186,11 +180,12 @@ function make_sure_instance_join_in_cluster() {
 
     for host in "${out[@]}"; do
         if [[ "$host" == "$report_host" ]]; then
-          join_in_cluster=1
+            join_in_cluster=1
             echo "$report_host successfully join_in_cluster"
         fi
     done
 }
+
 function rejoin_in_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
     ${mysqlshell} -e "cluster=dba.getCluster(); cluster.rejoinInstance('${replication_user}@${report_host}',{password:'${MYSQL_ROOT_PASSWORD}'})"
@@ -203,6 +198,7 @@ function rejoin_in_cluster() {
     done
 }
 
+export pid
 function reboot_from_completeOutage() {
     local mysqlshell="mysqlsh -u${replication_user} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
     #https://dev.mysql.com/doc/dev/mysqlsh-api-javascript/8.0/classmysqlsh_1_1dba_1_1_dba.html#ac68556e9a8e909423baa47dc3b42aadb
@@ -212,7 +208,6 @@ function reboot_from_completeOutage() {
     wait $pid
 }
 
-export pid
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
     /entrypoint.sh mysqld --user=root --report-host=$report_host --bind-address=* $args &
@@ -226,17 +221,26 @@ start_mysqld_in_background
 wait_for_host_online "root" "localhost" "$MYSQL_ROOT_PASSWORD"
 create_replication_user
 configure_instance
+
 if [[ "$restart_required" == "1" ]]; then
     start_mysqld_in_background
     wait_for_host_online "repl" "$report_host" "$MYSQL_ROOT_PASSWORD"
 fi
 
-while true; do
-    kill -0 $pid
+mysqld_alive=0
+function check_mysqld_alive() {
     kill -0 $pid
     exit="$?"
-    echo "exit code ------------------$exit--------------------"
     if [[ "$exit" == "0" ]]; then
+        mysqld_alive=1
+    else
+        mysqld_alive=0
+    fi
+}
+
+while true; do
+    check_mysqld_alive
+    if [[ "$mysqld_alive" == "1" ]]; then
         echo "mysqld process is running"
     else
         echo "need start mysqld and wait_for_mysqld_running"
@@ -249,9 +253,11 @@ while true; do
         log "WARNING" "signal is not present yet!"
         sleep 1
     done
+
     desired_func=$(cat /scripts/signal.txt)
     rm -rf /scripts/signal.txt
     echo $desired_func
+
     if [[ $desired_func == "create_cluster" ]]; then
         create_cluster
     fi
@@ -259,8 +265,6 @@ while true; do
     if [[ $desired_func == "join_in_cluster" ]]; then
         select_primary
         join_in_cluster
-        start_mysqld_in_background
-        wait_for_host_online "repl" "$report_host" "${MYSQL_ROOT_PASSWORD}"
         make_sure_instance_join_in_cluster
     fi
 
@@ -268,15 +272,15 @@ while true; do
         select_primary
         rejoin_in_cluster
         make_sure_instance_join_in_cluster
-        if [[ "$joined_in_cluster" == "0" ]];then
-          join_in_cluster
+        if [[ "$joined_in_cluster" == "0" ]]; then
+            join_in_cluster
         fi
     fi
 
     if [[ $desired_func == "reboot_from_complete_outage" ]]; then
         reboot_from_completeOutage
     fi
-    echo "wating for pid = $pid"
+    log "INFO" "waiting for mysql process id  = $pid"
     wait $pid
 
 done
