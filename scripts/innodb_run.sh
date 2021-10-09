@@ -80,21 +80,19 @@ function create_replication_user() {
         log "INFO" "Replication user not found. Creating new replication user..."
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' REQUIRE SSL;"
-        retry 120 ${mysql} -N -e "GRANT ALL ON *.* TO 'repl'@'%' WITH GRANT OPTION;"
-        # it seems mysql-server docker image doesn't has the user root that can connect from any host
+        retry 120 ${mysql} -N -e "GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO 'repl'@'%' WITH GRANT OPTION;"
+        retry 120 ${mysql} -N -e "GRANT DELETE, INSERT, UPDATE ON mysql.* TO 'repl'@'%' WITH GRANT OPTION;"
+        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata.* TO 'repl'@'%' WITH GRANT OPTION;"
+        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_bkp.* TO 'repl'@'%' WITH GRANT OPTION;"
+        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_previous.* TO 'repl'@'%' WITH GRANT OPTION;"
+        retry 120 ${mysql} -N -e "GRANT CLONE_ADMIN, BACKUP_ADMIN, CONNECTION_ADMIN, EXECUTE, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN, REPLICATION_APPLIER, REPLICATION_SLAVE_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN ON *.* TO 'repl'@'%' WITH GRANT OPTION;"
+        #mysql-server docker image doesn't has the user root that can connect from any host
         retry 120 ${mysql} -N -e "CREATE USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';"
-        # todo use specific permission needed for replication user.
         retry 120 ${mysql} -N -e "GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;"
-        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning process
-        # https://dev.mysql.com/doc/refman/8.0/en/group-replication-cloning.html
-        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
-        #retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';"
-        #retry 120 ${mysql} -N -e "GRANT CLONE_ADMIN ON *.* TO 'repl'@'%';"
         retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
     fi
-
-    #retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
+#    retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
 }
 
 restart_required=0
