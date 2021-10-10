@@ -192,7 +192,7 @@ function install_group_replication_plugin() {
         log "INFO" "Group replication plugin is not installed. Installing the plugin...."
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
         # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
-#        joining_for_first_time=1
+        #        joining_for_first_time=1
         retry 120 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
         log "INFO" "Group replication plugin successfully installed"
     else
@@ -291,9 +291,9 @@ function bootstrap_cluster() {
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=$localhost"
     log "INFO" "bootstrapping cluster with host $report_host..."
-#    if [[ "$joining_for_first_time" == "1" ]]; then
-#        retry 120 ${mysql} -N -e "RESET MASTER;"
-#    fi
+    #    if [[ "$joining_for_first_time" == "1" ]]; then
+    #        retry 120 ${mysql} -N -e "RESET MASTER;"
+    #    fi
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
@@ -305,10 +305,10 @@ function join_into_cluster() {
     local mysql="$mysql_header --host=$report_host"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
-#    if [[ "$joining_for_first_time" == "1" ]]; then
-#        log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
-#        retry 120 ${mysql} -N -e "RESET MASTER;"
-#    fi
+    #    if [[ "$joining_for_first_time" == "1" ]]; then
+    #        log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
+    #        retry 120 ${mysql} -N -e "RESET MASTER;"
+    #    fi
 
     # run `START GROUP_REPLICATION` until the the member successfully join into the group
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
