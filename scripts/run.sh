@@ -31,6 +31,7 @@ function log() {
     local msg="$2"
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
+
 function retry {
     local retries="$1"
     shift
