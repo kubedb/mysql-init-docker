@@ -14,13 +14,13 @@
 #   POD_IP              = IP address used to create whitelist CIDR. For HOST_ADDRESS_TYPE=DNS, it will be status.PodIP.
 #   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
 
-#holds all the args passed from statefulset
+env | sort | grep "POD\|HOST\|NAME"
+
 args=$@
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
-localhost="127.0.0.1"
 
 function timestamp() {
     date +"%Y/%m/%d %T"
@@ -62,17 +62,40 @@ hosts=$(cat "/scripts/peer-list")
 IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
+
 report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
 echo "report_host = $report_host "
-svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1))
-echo "-------------------------server_id =  $svr_id --------------------------"
 
 # comma separated host names
 export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
-echo "------------------hosts = -----${hosts[@]}---------------"
+
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
 export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
-echo "----------------------------seeds = -----${seeds[@]}------------------"
+
+# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 2^32 − 1.
+# “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
+# https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
+svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1))
+echo "server_id =  $svr_id"
+
+localhost="127.0.0.1"
+if [[ "$POD_IP_TYPE" == "IPv6" ]]; then
+    localhost="::1"
+fi
+
+# Get ip_whitelist
+# https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
+# https://dev.mysql.com/doc/refman/5.7/en/group-replication-ip-address-whitelisting.html
+# Now use this IP with CIDR notation
+whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
+if [ -z "$whitelist" ]; then
+    if [[ "$POD_IP_TYPE" == "IPv6" ]]; then
+        whitelist="$POD_IP"/64
+    else
+        whitelist="$POD_IP"/16
+    fi
+fi
+
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
@@ -106,8 +129,10 @@ loose-group_replication_recovery_use_ssl = 1
 # Shared replication group configuration
 loose-group_replication_group_name = "${GROUP_NAME}"
 #loose-group_replication_ip_whitelist = "${hosts}"
-loose-group_replication_ip_whitelist = "AUTOMATIC"
-loose-group_replication_ip_allowlist = "AUTOMATIC"
+#loose-group_replication_ip_whitelist = "AUTOMATIC"
+#loose-group_replication_ip_allowlist = "AUTOMATIC"
+loose-group_replication_ip_whitelist = "${whitelist}"
+loose-group_replication_ip_allowlist = "${whitelist}"
 loose-group_replication_group_seeds = "${seeds}"
 
 # Single or Multi-primary mode? Uncomment these two lines
@@ -123,8 +148,6 @@ bind-address = *
 report_host = "${report_host}"
 loose-group_replication_local_address = "${report_host}:33061"
 EOL
-
-#----------------------------------------------------------------------------------------------------------------------
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
@@ -176,7 +199,7 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
 
         retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
-        retry 120 ${mysql} -N -e "reset master;"
+        retry 120 ${mysql} -N -e "RESET MASTER;"
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
     fi
@@ -217,23 +240,6 @@ function install_clone_plugin() {
     fi
 }
 
-function bootstrap_cluster() {
-    # for bootstrap group replication, the following steps have been taken:
-    # - initially reset the member to cleanup all data configuration/set the binlog and gtid's initial position.
-    #   ref: https://dev.mysql.com/doc/refman/8.0/en/reset-master.html
-    # - set global variable group_replication_bootstrap_group to `ON`
-    # - start group replication
-    # - set global variable group_replication_bootstrap_group to `OFF`
-    #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
-    local mysql="$mysql_header --host=$localhost"
-    log "INFO" "bootstrapping cluster with host $report_host..."
-    if [[ "$joining_for_first_time" == "1" ]]; then
-        retry 120 ${mysql} -N -e "RESET MASTER;"
-    fi
-    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
-    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
-}
 function check_member_list_updated() {
     for host in $@; do
         local mysql="$mysql_header --host=$host"
@@ -295,6 +301,7 @@ function wait_for_primary() {
         fi
     done
 }
+
 # declare donors array for further use
 declare -a donors
 function set_valid_donors() {
@@ -339,6 +346,24 @@ function set_valid_donors() {
     fi
 }
 
+function bootstrap_cluster() {
+    # for bootstrap group replication, the following steps have been taken:
+    # - initially reset the member to cleanup all data configuration/set the binlog and gtid's initial position.
+    #   ref: https://dev.mysql.com/doc/refman/8.0/en/reset-master.html
+    # - set global variable group_replication_bootstrap_group to `ON`
+    # - start group replication
+    # - set global variable group_replication_bootstrap_group to `OFF`
+    #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
+    local mysql="$mysql_header --host=$localhost"
+    log "INFO" "bootstrapping cluster with host $report_host..."
+    if [[ "$joining_for_first_time" == "1" ]]; then
+        retry 120 ${mysql} -N -e "RESET MASTER;"
+    fi
+    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
+    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
+}
+
 function join_into_cluster() {
     # member try to join into the existing group
     log "INFO" "The replica, ${report_host} is joining into the existing group..."
@@ -352,8 +377,7 @@ function join_into_cluster() {
         log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
-        if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 1 ]]; then
-            echo "-----------------------$donor{*}----------------------"
+        if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $report_host....."
                 error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
@@ -372,7 +396,6 @@ function join_into_cluster() {
                 for i in {120..0}; do
                     kill -0 $pid
                     exit="$?"
-                    echo "exit code ------------------$exit--------------------"
                     log "INFO" "Attempt $i: Checking mysqld(process id=$pid) is alive or not, exit code: $exit"
                     if [[ "$exit" != "0" ]]; then
                         mysqld_alive=0
@@ -404,6 +427,7 @@ function join_into_cluster() {
 
     echo "end join in cluster"
 }
+
 export pid
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
@@ -411,13 +435,8 @@ function start_mysqld_in_background() {
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
-# run the mysqld process in background with user provided arguments if any
-#log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-#docker-entrypoint.sh mysqld $args &
-#pid=$!
-#log "INFO" "The process id of mysqld is '$pid'"
+
 start_mysqld_in_background
-echo "-------------------------------------------------pid = "$pid "-------------------------------"
 
 # create mysql client with user exported in mysql_header and export password
 # this is to bypass the warning message for using password
@@ -439,19 +458,9 @@ install_group_replication_plugin
 # ensure clone plugin
 install_clone_plugin
 
-#what do i want
-#if mysql process is not running then run mysql and wait
-#then wait for signal and run signal <create cluster or join in cluster>
-#wait for pid
-#if pid exit
-# then restart from the top
-
-# how do i achive that?
-
 while true; do
     kill -0 $pid
     exit="$?"
-    echo "exit code ------------------$exit--------------------"
     if [[ "$exit" == "0" ]]; then
         echo "mysqld process is running"
     else
@@ -467,7 +476,7 @@ while true; do
     done
     desired_func=$(cat /scripts/signal.txt)
     rm -rf /scripts/signal.txt
-    echo $desired_func
+    log "INFO" "going to execute $desired_func"
     if [[ $desired_func == "create_cluster" ]]; then
         bootstrap_cluster
     fi
@@ -477,10 +486,7 @@ while true; do
         wait_for_primary "${member_hosts[*]}"
         set_valid_donors
         join_into_cluster
-        echo "  mysqld alive $mysqld_alive"
     fi
-    echo $pid
+    log "INFO" "waiting for mysql process id  = $pid"
     wait $pid
-    sleep 11
-
 done

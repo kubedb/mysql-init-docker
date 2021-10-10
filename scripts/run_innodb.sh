@@ -68,7 +68,8 @@ function create_replication_user() {
     # MySql server's need a replication user to communicate with each other
     # 01. official doc (section from 17.2.1.3 to 17.2.1.5): https://dev.mysql.com/doc/refman/5.7/en/group-replication-user-credentials.html
     # 02. https://dev.mysql.com/doc/refman/8.0/en/group-replication-secure-user.html
-    # 03. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
+    # 03. repl user permissions: https://www.sqlshack.com/deploy-mysql-innodb-clusters-for-high-availability/
+    # 04. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
     log "INFO" "Checking whether replication user exist or not..."
     local mysql="mysql -u ${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} --port=3306"
 
@@ -254,7 +255,7 @@ while true; do
 
     desired_func=$(cat /scripts/signal.txt)
     rm -rf /scripts/signal.txt
-    echo $desired_func
+    log "INFO" "going to execute $desired_func"
 
     if [[ $desired_func == "create_cluster" ]]; then
         create_cluster
