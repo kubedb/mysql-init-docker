@@ -24,10 +24,12 @@ if [ "$POD_IP_TYPE" = "IPv6" ]; then
     exit 1
 fi
 
+args=$@
 script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
+localhost=127.0.0.1
 
 function timestamp() {
     date +"%Y/%m/%d %T"
@@ -39,20 +41,40 @@ function log() {
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
 
-# get the host names from stdin sent by peer-finder program
+# retry a command up to a specific number of times until it exits successfully,
+function retry {
+    local retries="$1"
+    shift
 
-cur_host=$(echo -n ${HOST_ADDRESS} | sed -e "s/.svc.cluster.local//g")
-log "INFO" "I am $cur_host"
+    local count=0
+    local wait=1
+    until "$@"; do
+        exit="$?"
+        if [ $count -lt $retries ]; then
+            log "INFO" "Attempt $count/$retries. Command exited with exit_code: $exit. Retrying after $wait seconds..."
+            sleep $wait
+        else
+            log "INFO" "Command failed in all $retries attempts with exit_code: $exit. Stopping trying any further...."
+            return $exit
+        fi
+        count=$(($count + 1))
+    done
+    return 0
+}
 
-log "INFO" "Reading standard input..."
-while read -ra line; do
-    tmp=$(echo -n ${line[0]} | sed -e "s/.svc.cluster.local//g")
-    peers=("${peers[@]}" "$tmp")
-
+# wait for the peer-list file created by coordinator
+while [ ! -f "/scripts/peer-list" ]; do
+    log "WARNING" "peer-list is not created yet"
+    sleep 1
 done
-log "INFO" "Trying to start group with peers'${peers[*]}'"
 
-# store the value for the variables those will be written in /etc/mysql/my.cnf file
+hosts=$(cat "/scripts/peer-list")
+IFS=', ' read -r -a peers <<<"$hosts"
+echo "${peers[@]}"
+log "INFO" "hosts are ${peers[@]}"
+
+report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
+echo "report_host = $report_host "
 
 # comma separated host names
 export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
@@ -63,19 +85,8 @@ export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 # In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 2^32 − 1.
 # “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
-# the server ID is calculated using the below formula:
-# server_id=statefulset_ordinal * 100 + pod_ordinal + 1
-if [[ "${BASE_NAME}" == "${DB_NAME}" ]]; then
-    declare -i ss_ordinal=0
-else
-    declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
-fi
-declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
-declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
-
-cur_addr="${cur_host}:33061"
-
-localhost="127.0.0.1"
+svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1))
+echo "server_id =  $svr_id"
 
 # Get ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
@@ -117,6 +128,7 @@ loose-group_replication_recovery_use_ssl = 1
 
 # Shared replication group configuration
 loose-group_replication_group_name = "${GROUP_NAME}"
+#loose-group_replication_ip_whitelist = "AUTOMATIC"
 loose-group_replication_ip_whitelist = "${whitelist}"
 loose-group_replication_group_seeds = "${seeds}"
 
@@ -127,39 +139,11 @@ loose-group_replication_group_seeds = "${seeds}"
 
 # Host specific replication configuration
 server_id = ${svr_id}
-#bind-address = "${cur_host}"
+#bind-address = "${report_host}"
 bind-address = "0.0.0.0"
-report_host = "${cur_host}"
-loose-group_replication_local_address = "${cur_addr}"
+report_host = "${report_host}"
+loose-group_replication_local_address = "${report_host}:33061"
 EOL
-
-# run the mysqld process in background with user provided arguments if any
-log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-docker-entrypoint.sh mysqld $@ &
-
-pid=$!
-log "INFO" "The process id of mysqld is '$pid'"
-
-# retry a command up to a specific number of times until it exits successfully,
-function retry {
-    local retries="$1"
-    shift
-
-    local count=0
-    local wait=1
-    until "$@"; do
-        exit="$?"
-        if [ $count -lt $retries ]; then
-            log "INFO" "Attempt $count/$retries. Command exited with exit_code: $exit. Retrying after $wait seconds..."
-            sleep $wait
-        else
-            log "INFO" "Command failed in all $retries attempts with exit_code: $exit. Stopping trying any further...."
-            return $exit
-        fi
-        count=$(($count + 1))
-    done
-    return 0
-}
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
@@ -167,7 +151,7 @@ function wait_for_mysqld_running() {
 
     for i in {900..0}; do
         out=$(mysql -N -e "select 1;" 2>/dev/null)
-        log "INFO" "Attempt $i: Pinging '$cur_host' has returned: '$out'...................................."
+        log "INFO" "Attempt $i: Pinging '$report_host' has returned: '$out'...................................."
         if [[ "$out" == "1" ]]; then
             break
         fi
@@ -178,7 +162,7 @@ function wait_for_mysqld_running() {
 
     if [[ "$i" == "0" ]]; then
         echo ""
-        log "ERROR" "Server ${cur_host} failed to start in 900 seconds............."
+        log "ERROR" "Server ${report_host} failed to start in 900 seconds............."
         exit 1
     fi
     log "INFO" "mysql daemon is ready to use......."
@@ -206,6 +190,7 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
 
         retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
+        retry 120 ${mysql} -N -e "RESET MASTER;"
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
     fi
@@ -221,8 +206,6 @@ function install_group_replication_plugin() {
     if [[ -z "$out" ]]; then
         log "INFO" "Group replication plugin is not installed. Installing the plugin...."
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
-        # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
-        joining_for_first_time=1
         retry 120 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
         log "INFO" "Group replication plugin successfully installed"
     else
@@ -234,7 +217,7 @@ function check_existing_cluster() {
     log "INFO" "Checking whether there exists any replication group or not..."
     cluster_exists=0
     for host in $@; do
-        if [[ "$cur_host" == "$host" ]]; then
+        if [[ "$report_host" == "$host" ]]; then
             continue
         fi
         local mysql="$mysql_header --host=${host}"
@@ -250,12 +233,14 @@ function check_existing_cluster() {
 }
 
 function check_member_list_updated() {
+    echo $report_host
     for host in $@; do
         local mysql="$mysql_header --host=$host"
-        if [[ "$cur_host" == "$host" ]]; then
+        if [[ "$report_host" == "$host" ]]; then
             continue
         fi
         for i in {60..0}; do
+            echo $host
             alive_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
             alive_cluster_size=${#alive_members_id[@]}
             listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
@@ -272,7 +257,7 @@ function check_member_list_updated() {
 function wait_for_primary() {
     log "INFO" "Waiting for group primary......"
     for host in $@; do
-        if [[ "$cur_host" == "$host" ]]; then
+        if [[ "$report_host" == "$host" ]]; then
             continue
         fi
         local mysql="$mysql_header --host=${host}"
@@ -317,10 +302,7 @@ function bootstrap_cluster() {
     # - set global variable group_replication_bootstrap_group to `OFF`
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=$localhost"
-    log "INFO" "bootstrapping cluster with host $cur_host..."
-    if [[ "$joining_for_first_time" == "1" ]]; then
-        retry 120 ${mysql} -N -e "RESET MASTER;"
-    fi
+    log "INFO" "bootstrapping cluster with host $report_host..."
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
@@ -328,26 +310,29 @@ function bootstrap_cluster() {
 
 function join_into_cluster() {
     # member try to join into the existing group
-    log "INFO" "The replica, ${cur_host} is joining into the existing group..."
-    local mysql="$mysql_header --host=$localhost"
-
-    # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
-    if [[ "$joining_for_first_time" == "1" ]]; then
-        log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
-        retry 120 ${mysql} -N -e "RESET MASTER;"
-    fi
+    log "INFO" "The replica, ${report_host} is joining into the existing group..."
+    local mysql="$mysql_header --host=$report_host"
 
     # run `START GROUP_REPLICATION` until the the member successfully join into the group
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
-    log "INFO" "Group replication on (${cur_host}) has been taken place..."
+    log "INFO" "Group replication on (${report_host}) has been taken place..."
 }
+
+export pid
+function start_mysqld_in_background() {
+    log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld ${args[@]}'..."
+    docker-entrypoint.sh mysqld $args &
+    pid=$!
+    log "INFO" "The process id of mysqld is '$pid'"
+}
+
+start_mysqld_in_background
 
 # create mysql client with user exported in mysql_header and export password
 # this is to bypass the warning message for using password
 export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
 export member_hosts=$(echo -n ${hosts} | sed -e "s/,/ /g")
-export joining_for_first_time=0
 log "INFO" "Host lists: ${member_hosts[@]}"
 
 # wait for mysqld to be ready
@@ -359,17 +344,34 @@ create_replication_user
 # ensure replication plugin
 install_group_replication_plugin
 
-# checking group replication existence
-check_existing_cluster "${member_hosts[*]}"
+while true; do
+    kill -0 $pid
+    exit="$?"
+    if [[ "$exit" == "0" ]]; then
+        echo "mysqld process is running"
+    else
+        echo "need start mysqld and wait_for_mysqld_running"
+        start_mysqld_in_background
+        wait_for_mysqld_running
+    fi
 
-if [[ "$cluster_exists" == "1" ]]; then
-    check_member_list_updated "${member_hosts[*]}"
-    wait_for_primary "${member_hosts[*]}"
-    join_into_cluster
-else
-    bootstrap_cluster
-fi
+    # wait for the script copied by coordinator
+    while [ ! -f "/scripts/signal.txt" ]; do
+        log "WARNING" "signal is not present yet!"
+        sleep 1
+    done
+    desired_func=$(cat /scripts/signal.txt)
+    rm -rf /scripts/signal.txt
+    log "INFO" "going to execute $desired_func"
+    if [[ $desired_func == "create_cluster" ]]; then
+        bootstrap_cluster
+    fi
 
-# wait for mysqld process running in background
-log "INFO" "Waiting for mysqld process running in foreground..."
-wait $pid
+    if [[ $desired_func == "join_in_cluster" ]]; then
+        # check_member_list_updated "${member_hosts[*]}"
+        wait_for_primary "${member_hosts[*]}"
+        join_into_cluster
+    fi
+    echo $pid
+    wait $pid
+done
