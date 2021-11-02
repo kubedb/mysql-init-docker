@@ -202,6 +202,12 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "RESET MASTER;"
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
+        #making sure user get permission if it's get upgraded from a non clone supported mysql version
+        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
+        retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';"
+        retry 120 ${mysql} -N -e "GRANT CLONE_ADMIN ON *.* TO 'repl'@'%';"
+        retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
+        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
     fi
 }
 
