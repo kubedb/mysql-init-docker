@@ -26,8 +26,20 @@ hosts=$(cat "/scripts/peer-list")
 IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
+
+whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
+if [ -z "$whitelist" ]; then
+    if [[ "$POD_IP_TYPE" == "IPv6" ]]; then
+        whitelist="$POD_IP"/64
+    else
+        whitelist="$POD_IP"/16
+    fi
+fi
+
 cat >>/etc/my.cnf <<EOL
 default_authentication_plugin=mysql_native_password
+#loose-group_replication_ip_whitelist = "${whitelist}"
+loose-group_replication_ip_allowlist = "${whitelist}"
 EOL
 
 function retry {
@@ -53,9 +65,9 @@ function wait_for_host_online() {
     #function called with parameter user,host,password
     log "INFO" "checking for host $2 to come online"
 
-    local mysqlshell="mysqlsh -u$1 -h$2 -p$3" # "mysql -uroot -ppass -hmysql-server-0.mysql-server.default.svc"
-    retry 900 ${mysqlshell} --sql -e "select 1;" | awk '{print$1}'
-    out=$(${mysqlshell} --sql -e "select 1;" | head -n1 | awk '{print$1}')
+    local mysqlshell="mysql -u$1 -h$2 -p$3" # "mysql -uroot -ppass -hmysql-server-0.mysql-server.default.svc"
+    retry 900 ${mysqlshell} -e "select 1;" | awk '{print$1}'
+    out=$(${mysqlshell} -e "select 1;" | head -n1 | awk '{print$1}')
     if [[ "$out" == "1" ]]; then
         log "INFO" "host $2 is online"
     else
@@ -213,7 +225,6 @@ function start_mysqld_in_background() {
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
-
 replication_user=repl
 
 start_mysqld_in_background
