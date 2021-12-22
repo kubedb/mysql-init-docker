@@ -21,7 +21,7 @@ function log() {
     local msg="$2"
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
-
+echo $BASE_NAME
 svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 11))
 echo "server_id =  $svr_id"
 
