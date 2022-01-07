@@ -38,6 +38,7 @@ if [ -z "$whitelist" ]; then
 fi
 
 cat >>/etc/my.cnf <<EOL
+!includedir /etc/mysql/conf.d
 default_authentication_plugin=mysql_native_password
 #loose-group_replication_ip_whitelist = "${whitelist}"
 loose-group_replication_ip_allowlist = "${whitelist}"

@@ -487,6 +487,7 @@ while true; do
         set_valid_donors
         join_into_cluster
     fi
+    joining_for_first_time=0
     log "INFO" "waiting for mysql process id  = $pid"
     wait $pid
 done
