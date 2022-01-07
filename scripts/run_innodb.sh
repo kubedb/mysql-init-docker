@@ -186,9 +186,9 @@ function join_in_cluster() {
 }
 
 joined_in_cluster=0
-check_instance_joined_in_cluster(){
-  local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
-  out=($(${mysqlshell} --sql -e "SELECT member_host FROM performance_schema.replication_group_members;"))
+check_instance_joined_in_cluster() {
+    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    out=($(${mysqlshell} --sql -e "SELECT member_host FROM performance_schema.replication_group_members;"))
 
     for host in "${out[@]}"; do
         if [[ "$host" == "$report_host" ]]; then
