@@ -32,7 +32,7 @@ echo "!includedir /etc/mysql/read_only.conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/read_only.conf.d/read.cnf <<EOL
 [mysqld]
 #disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
-
+datadir="/var/lib/mysql/data"
 # General replication settings
 gtid_mode = ON
 enforce_gtid_consistency = ON
@@ -82,7 +82,7 @@ if [[ "$require_ssl" == "true" ]]; then
     x=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/certs/ca.crt'"
 fi
 echo $x
-out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_HOST = 'mysql.demo.svc',MASTER_PORT = 3306,MASTER_USER = '$read_only_user',MASTER_PASSWORD = '$read_only_password',MASTER_AUTO_POSITION = 1 $x;")
+out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$read_only_user',MASTER_PASSWORD = '$read_only_password',MASTER_AUTO_POSITION = 1 $x;")
 echo $out
 sleep 1
 out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "start slave;")
