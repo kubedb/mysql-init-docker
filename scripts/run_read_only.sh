@@ -32,7 +32,7 @@ echo "!includedir /etc/mysql/read_only.conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/read_only.conf.d/read.cnf <<EOL
 [mysqld]
 #disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
-datadir="/var/lib/mysql/data"
+datadir=/var/lib/mysql/data
 # General replication settings
 gtid_mode = ON
 enforce_gtid_consistency = ON
@@ -78,8 +78,13 @@ export MYSQL_PWD=${PASSWORD}
 wait_for_mysqld_running
 mysql="$mysql_header --host=$localhost"
 #out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-if [[ "$require_ssl" == "true" ]]; then
-    x=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/certs/ca.crt'"
+if [[ "$source_ssl" == "true" ]]; then
+    x=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+#    ALTER USER 'root'@'$hostToConnect' REQUIRE SSL;
+ out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e " CREATE USER 'root'@'$hostToConnect' IDENTIFIED BY '$read_only_password' REQUIRE SSL;")
+ echo out
+ out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "FLUSH PRIVILEGES;")
+ echo out
 fi
 echo $x
 out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$read_only_user',MASTER_PASSWORD = '$read_only_password',MASTER_AUTO_POSITION = 1 $x;")
