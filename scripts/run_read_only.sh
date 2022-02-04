@@ -9,8 +9,6 @@ args=$@
 echo "-----------------------$args-------------------------"
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
-read_user="$read_only_user"
-read_password="$read_only_password"
 localhost=127.0.0.1
 function timestamp() {
     date +"%Y/%m/%d %T"
@@ -21,11 +19,33 @@ function log() {
     local msg="$2"
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
+
+function retry {
+    local retries="$1"
+    shift
+
+    local count=0
+    local wait=1
+    until "$@"; do
+        exit="$?"
+        if [ $count -lt $retries ]; then
+            log "INFO" "Attempt $count/$retries. Command exited with exit_code: $exit. Retrying after $wait seconds..."
+            sleep $wait
+        else
+            log "INFO" "Command failed in all $retries attempts with exit_code: $exit. Stopping trying any further...."
+            return $exit
+        fi
+        count=$(($count + 1))
+    done
+    return 0
+}
+
 echo $BASE_NAME
 svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 11))
-echo "server_id =  $svr_id"
+log "INFO" "server_id =  $svr_id"
 
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
+
 mkdir -p /etc/mysql/read_only.conf.d/
 echo "!includedir /etc/mysql/read_only.conf.d/" >>/etc/mysql/my.cnf
 
@@ -41,13 +61,32 @@ server_id = ${svr_id}
 bind-address = "0.0.0.0"
 #report_host = "${report_host}"
 EOL
+
 export pid
+
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld ${args[@]}'..."
     docker-entrypoint.sh mysqld $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
+
+function install_clone_plugin() {
+    log "INFO" "Checking whether clone plugin on host $1 is installed or not...."
+    local mysql="$mysql_header --host=$1"
+
+    # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
+    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep clone
+    out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep clone)
+    if [[ -z "$out" ]]; then
+        log "INFO" "Clone plugin is not installed. Installing the plugin..."
+        retry 120 ${mysql} -e "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
+        log "INFO" "Clone plugin successfully installed"
+    else
+        log "INFO" "Already clone plugin is installed"
+    fi
+}
+
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
@@ -71,25 +110,48 @@ function wait_for_mysqld_running() {
     fi
     log "INFO" "mysql daemon is ready to use......."
 }
-start_mysqld_in_background
+
+
+function start_read_replica() {
+  #stop_slave
+  local mysql="$mysql_header --host=$localhost"
+
+  if [[ "$source_ssl" == "true" ]]; then
+    x=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+  fi
+  echo $x
+  out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $x;")
+  echo $out
+  sleep 1
+  out=$($mysql_header -e "start slave;")
+  echo $out
+  #configure_host
+  #start_salve
+}
+
+# create mysql client with user exported in mysql_header and export password
+# this is to bypass the warning message for using password
 export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
 
+start_mysqld_in_background
+
 wait_for_mysqld_running
-mysql="$mysql_header --host=$localhost"
-#out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-if [[ "$source_ssl" == "true" ]]; then
-    x=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
-#    ALTER USER 'root'@'$hostToConnect' REQUIRE SSL;
- out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e " CREATE USER 'root'@'$hostToConnect' IDENTIFIED BY '$read_only_password' REQUIRE SSL;")
- echo out
- out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "FLUSH PRIVILEGES;")
- echo out
-fi
-echo $x
-out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$read_only_user',MASTER_PASSWORD = '$read_only_password',MASTER_AUTO_POSITION = 1 $x;")
-echo $out
-sleep 1
-out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "start slave;")
-echo $pid
-wait $pid
+
+install_clone_plugin "localhost"
+install_clone_plugin "$hostToConnect"
+
+while true; do
+    kill -0 $pid
+    exit="$?"
+    if [[ "$exit" == "0" ]]; then
+        echo "mysqld process is running"
+    else
+        echo "need start mysqld and wait_for_mysqld_running"
+        start_mysqld_in_background
+        wait_for_mysqld_running
+    fi
+    start_read_replica
+    log "INFO" "waiting for mysql process id  = $pid"
+    wait $pid
+done
