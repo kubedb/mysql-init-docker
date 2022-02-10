@@ -51,8 +51,8 @@ echo "!includedir /etc/mysql/read_only.conf.d/" >>/etc/mysql/my.cnf
 
 cat >>/etc/mysql/read_only.conf.d/read.cnf <<EOL
 [mysqld]
-#disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
-datadir=/var/lib/mysql/data
+default-authentication-plugin=mysql_native_password
+disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
 # General replication settings
 gtid_mode = ON
 enforce_gtid_consistency = ON
@@ -66,11 +66,11 @@ export pid
 
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld ${args[@]}'..."
-    docker-entrypoint.sh mysqld $args &
+    docker-entrypoint.sh mysqld  $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
-
+reading_first_time=0
 function install_clone_plugin() {
     log "INFO" "Checking whether clone plugin on host $1 is installed or not...."
     local mysql="$mysql_header --host=$1"
@@ -81,6 +81,7 @@ function install_clone_plugin() {
     if [[ -z "$out" ]]; then
         log "INFO" "Clone plugin is not installed. Installing the plugin..."
         retry 120 ${mysql} -e "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
+        reading_first_time=1
         log "INFO" "Clone plugin successfully installed"
     else
         log "INFO" "Already clone plugin is installed"
@@ -117,10 +118,11 @@ function start_read_replica() {
   local mysql="$mysql_header --host=$localhost"
 
   if [[ "$source_ssl" == "true" ]]; then
-    x=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+    ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+    require_SSL="REQUIRE SSL"
   fi
-  echo $x
-  out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $x;")
+  echo $ssl_config
+  out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
   echo $out
   sleep 1
   out=$($mysql_header -e "start slave;")
@@ -131,10 +133,11 @@ function start_read_replica() {
 
 # create mysql client with user exported in mysql_header and export password
 # this is to bypass the warning message for using password
+start_mysqld_in_background
+
 export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
 
-start_mysqld_in_background
 
 wait_for_mysqld_running
 
@@ -151,7 +154,22 @@ while true; do
         start_mysqld_in_background
         wait_for_mysqld_running
     fi
+
+    if [[ "$reading_first_time" == "1" ]];then
+
+      out=$($mysql_header -e "SET GLOBAL clone_valid_donor_list='$hostToConnect:3306';")
+      echo "------------$out-----------"
+
+
+       error_message=$(${mysql_header}  -e "CLONE INSTANCE FROM 'root'@'$hostToConnect':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
+
+       # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
+      log "INFO" "Clone error message: $error_message"
+
+
+    fi
     start_read_replica
     log "INFO" "waiting for mysql process id  = $pid"
+    reading_first_time=0
     wait $pid
 done

@@ -197,6 +197,7 @@ check_instance_joined_in_cluster() {
         fi
     done
 }
+
 function make_sure_instance_join_in_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
     retry 10 ${mysqlshell} -e "cluster = dba.getCluster();  cluster.rescan({addInstances:['${report_host}:3306'],interactive:false})"
@@ -230,6 +231,7 @@ function start_mysqld_in_background() {
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
+
 replication_user=repl
 
 start_mysqld_in_background
