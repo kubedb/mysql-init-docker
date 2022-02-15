@@ -31,7 +31,6 @@ echo "!includedir /etc/mysql/read_only.conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/read_only.conf.d/read.cnf <<EOL
 [mysqld]
 #disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
-
 # General replication settings
 gtid_mode = ON
 enforce_gtid_consistency = ON
@@ -40,7 +39,9 @@ server_id = ${svr_id}
 bind-address = "0.0.0.0"
 #report_host = "${report_host}"
 EOL
+
 export pid
+
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld ${args[@]}'..."
     docker-entrypoint.sh mysqld $args &
@@ -70,16 +71,45 @@ function wait_for_mysqld_running() {
     fi
     log "INFO" "mysql daemon is ready to use......."
 }
+
+function start_read_replica() {
+  #stop_slave
+  local mysql="$mysql_header --host=$localhost"
+
+  if [[ "$source_ssl" == "true" ]]; then
+    ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+    require_SSL="REQUIRE SSL"
+  fi
+  echo $ssl_config
+  out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
+  echo $out
+  sleep 1
+  out=$($mysql_header -e "start slave;")
+  echo $out
+}
+
 start_mysqld_in_background
+
 export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
 
 wait_for_mysqld_running
-local mysql="$mysql_header --host=$localhost"
-#out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "CHANGE MASTER TO MASTER_HOST = 'mysql.demo.svc',MASTER_PORT = 3306,MASTER_USER = '$read_only_user',MASTER_PASSWORD = '$read_only_password',MASTER_AUTO_POSITION = 1;")
-echo $out
-sleep 1
-out=$(mysql -uroot -p$MYSQL_ROOT_PASSWORD -e "start slave;")
-echo $pid
-wait $pid
+
+while true; do
+    kill -0 $pid
+    exit="$?"
+
+    if [[ "$exit" == "0" ]]; then
+        echo "mysqld process is running"
+    else
+        echo "need to start mysqld and wait_for_mysqld_running"
+        start_mysqld_in_background
+        wait_for_mysqld_running
+    fi
+
+    start_read_replica
+    log "INFO" "waiting for mysql process id  = $pid"
+
+    reading_first_time=0
+    wait $pid
+done
