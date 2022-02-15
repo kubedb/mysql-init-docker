@@ -15,8 +15,6 @@ function log() {
 args=$@
 report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
 log "INFO" "report_host = $report_host"
-mkdir -p "/var/lib/mysql"
-mkdir -p "/var/lib/mysql-files"
 # wait for the peer-list file created by coordinator
 while [ ! -f "/scripts/peer-list" ]; do
     log "WARNING" "peer-list is not created yet"
@@ -38,7 +36,7 @@ if [ -z "$whitelist" ]; then
 fi
 
 cat >>/etc/my.cnf <<EOL
-!includedir /etc/mysql/conf.d
+#!includedir /etc/mysql/conf.d
 default_authentication_plugin=mysql_native_password
 #loose-group_replication_ip_whitelist = "${whitelist}"
 loose-group_replication_ip_allowlist = "${whitelist}"
