@@ -2,6 +2,8 @@
 
 #   BASE_NAME           = name of the StatefulSet (same as the name of CRD)
 #   HOSTNAME            = name of the host | name of the pod (set by k8s)
+#   primaryHost         = primary dns of the source
+#   hostToConnect       = source dns
 
 env | sort | grep "POD\|HOST\|NAME"
 
@@ -51,7 +53,7 @@ echo "!includedir /etc/mysql/read_only.conf.d/" >>/etc/mysql/my.cnf
 
 cat >>/etc/mysql/read_only.conf.d/read.cnf <<EOL
 [mysqld]
-default-authentication-plugin=mysql_native_password
+#default-authentication-plugin=mysql_native_password
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
 # General replication settings
 gtid_mode = ON
@@ -59,7 +61,6 @@ enforce_gtid_consistency = ON
 # Host specific replication configuration
 server_id = ${svr_id}
 bind-address = "0.0.0.0"
-#report_host = "${report_host}"
 EOL
 
 export pid
@@ -70,6 +71,7 @@ function start_mysqld_in_background() {
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
+
 reading_first_time=0
 function install_clone_plugin() {
     log "INFO" "Checking whether clone plugin on host $1 is installed or not...."
@@ -127,8 +129,6 @@ function start_read_replica() {
   sleep 1
   out=$($mysql_header -e "start slave;")
   echo $out
-  #configure_host
-  #start_salve
 }
 
 # create mysql client with user exported in mysql_header and export password
@@ -142,7 +142,8 @@ export MYSQL_PWD=${PASSWORD}
 wait_for_mysqld_running
 
 install_clone_plugin "localhost"
-install_clone_plugin "$hostToConnect"
+
+install_clone_plugin "$primaryHost"
 
 while true; do
     kill -0 $pid
@@ -150,18 +151,18 @@ while true; do
     if [[ "$exit" == "0" ]]; then
         echo "mysqld process is running"
     else
-        echo "need start mysqld and wait_for_mysqld_running"
+        echo "need to start mysqld and wait_for_mysqld_running"
         start_mysqld_in_background
         wait_for_mysqld_running
     fi
 
     if [[ "$reading_first_time" == "1" ]];then
 
-      out=$($mysql_header -e "SET GLOBAL clone_valid_donor_list='$hostToConnect:3306';")
+      out=$($mysql_header -e "SET GLOBAL clone_valid_donor_list='$primaryHost:3306';")
       echo "------------$out-----------"
 
 
-       error_message=$(${mysql_header}  -e "CLONE INSTANCE FROM 'root'@'$hostToConnect':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
+       error_message=$(${mysql_header}  -e "CLONE INSTANCE FROM 'root'@'$primaryHost':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
 
        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
       log "INFO" "Clone error message: $error_message"
