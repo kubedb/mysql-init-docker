@@ -8,10 +8,11 @@
 env | sort | grep "POD\|HOST\|NAME"
 
 args=$@
-echo "-----------------------$args-------------------------"
+
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
 localhost=127.0.0.1
+
 function timestamp() {
     date +"%Y/%m/%d %T"
 }
@@ -158,17 +159,12 @@ while true; do
 
     if [[ "$reading_first_time" == "1" ]];then
 
-      out=$($mysql_header -e "SET GLOBAL clone_valid_donor_list='$primaryHost:3306';")
-      echo "------------$out-----------"
-
-
-       error_message=$(${mysql_header}  -e "CLONE INSTANCE FROM 'root'@'$primaryHost':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
-
+      $mysql_header -e "SET GLOBAL clone_valid_donor_list='$primaryHost:3306';")
+      error_message=$(${mysql_header}  -e "CLONE INSTANCE FROM 'root'@'$primaryHost':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
       log "INFO" "Clone error message: $error_message"
-
-
     fi
+
     start_read_replica
     log "INFO" "waiting for mysql process id  = $pid"
     reading_first_time=0
