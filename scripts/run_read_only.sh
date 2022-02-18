@@ -68,7 +68,7 @@ export pid
 
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld ${args[@]}'..."
-    docker-entrypoint.sh mysqld  $args &
+    docker-entrypoint.sh mysqld $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
@@ -90,7 +90,6 @@ function install_clone_plugin() {
         log "INFO" "Already clone plugin is installed"
     fi
 }
-
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
@@ -115,21 +114,20 @@ function wait_for_mysqld_running() {
     log "INFO" "mysql daemon is ready to use......."
 }
 
-
 function start_read_replica() {
-  #stop_slave
-  local mysql="$mysql_header --host=$localhost"
+    #stop_slave
+    local mysql="$mysql_header --host=$localhost"
 
-  if [[ "$source_ssl" == "true" ]]; then
-    ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
-    require_SSL="REQUIRE SSL"
-  fi
-  echo $ssl_config
-  out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
-  echo $out
-  sleep 1
-  out=$($mysql_header -e "start slave;")
-  echo $out
+    if [[ "$source_ssl" == "true" ]]; then
+        ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+        require_SSL="REQUIRE SSL"
+    fi
+    echo $ssl_config
+    out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
+    echo $out
+    sleep 1
+    out=$($mysql_header -e "start slave;")
+    echo $out
 }
 
 # create mysql client with user exported in mysql_header and export password
@@ -138,7 +136,6 @@ start_mysqld_in_background
 
 export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
-
 
 wait_for_mysqld_running
 
@@ -157,12 +154,12 @@ while true; do
         wait_for_mysqld_running
     fi
 
-    if [[ "$reading_first_time" == "1" ]];then
+    if [[ "$reading_first_time" == "1" ]]; then
 
-      $mysql_header -e "SET GLOBAL clone_valid_donor_list='$primaryHost:3306';")
-      error_message=$(${mysql_header}  -e "CLONE INSTANCE FROM 'root'@'$primaryHost':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
-       # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
-      log "INFO" "Clone error message: $error_message"
+        $mysql_header -e "SET GLOBAL clone_valid_donor_list='$primaryHost:3306';"
+        error_message=$(${mysql_header} -e "CLONE INSTANCE FROM 'root'@'$primaryHost':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
+        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
+        log "INFO" "Clone error message: $error_message"
     fi
 
     start_read_replica
