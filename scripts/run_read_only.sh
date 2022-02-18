@@ -73,19 +73,19 @@ function wait_for_mysqld_running() {
 }
 
 function start_read_replica() {
-  #stop_slave
-  local mysql="$mysql_header --host=$localhost"
+    #stop_slave
+    local mysql="$mysql_header --host=$localhost"
 
-  if [[ "$source_ssl" == "true" ]]; then
-    ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
-    require_SSL="REQUIRE SSL"
-  fi
-  echo $ssl_config
-  out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
-  echo $out
-  sleep 1
-  out=$($mysql_header -e "start slave;")
-  echo $out
+    if [[ "$source_ssl" == "true" ]]; then
+        ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+        require_SSL="REQUIRE SSL"
+    fi
+    echo $ssl_config
+    out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
+    echo $out
+    sleep 1
+    out=$($mysql_header -e "start slave;")
+    echo $out
 }
 
 start_mysqld_in_background
