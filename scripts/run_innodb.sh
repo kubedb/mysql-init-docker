@@ -15,7 +15,6 @@ function log() {
 args=$@
 report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
 log "INFO" "report_host = $report_host"
-
 # wait for the peer-list file created by coordinator
 while [ ! -f "/scripts/peer-list" ]; do
     log "WARNING" "peer-list is not created yet"
@@ -37,6 +36,7 @@ if [ -z "$whitelist" ]; then
 fi
 
 cat >>/etc/my.cnf <<EOL
+#!includedir /etc/mysql/conf.d
 default_authentication_plugin=mysql_native_password
 #loose-group_replication_ip_whitelist = "${whitelist}"
 loose-group_replication_ip_allowlist = "${whitelist}"
@@ -184,9 +184,8 @@ function join_in_cluster() {
 }
 
 joined_in_cluster=0
-function make_sure_instance_join_in_cluster() {
+check_instance_joined_in_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
-    retry 10 ${mysqlshell} -e "cluster = dba.getCluster();  cluster.rescan({addInstances:['${report_host}:3306'],interactive:false})"
     out=($(${mysqlshell} --sql -e "SELECT member_host FROM performance_schema.replication_group_members;"))
 
     for host in "${out[@]}"; do
@@ -195,6 +194,11 @@ function make_sure_instance_join_in_cluster() {
             echo "$report_host successfully join_in_cluster"
         fi
     done
+}
+
+function make_sure_instance_join_in_cluster() {
+    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    retry 10 ${mysqlshell} -e "cluster = dba.getCluster();  cluster.rescan({addInstances:['${report_host}:3306'],interactive:false})"
 }
 
 function rejoin_in_cluster() {
@@ -225,6 +229,7 @@ function start_mysqld_in_background() {
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
+
 replication_user=repl
 
 start_mysqld_in_background
@@ -275,13 +280,20 @@ while true; do
     if [[ $desired_func == "join_in_cluster" ]]; then
         select_primary
         join_in_cluster
-        make_sure_instance_join_in_cluster
+        check_instance_joined_in_cluster
+        if [[ "$joined_in_cluster" == "0" ]]; then
+            make_sure_instance_join_in_cluster
+        fi
     fi
 
     if [[ $desired_func == "rejoin_in_cluster" ]]; then
         select_primary
         rejoin_in_cluster
-        make_sure_instance_join_in_cluster
+        check_instance_joined_in_cluster
+        if [[ "$joined_in_cluster" == "0" ]]; then
+            make_sure_instance_join_in_cluster
+        fi
+        check_instance_joined_in_cluster
         if [[ "$joined_in_cluster" == "0" ]]; then
             join_in_cluster
         fi
