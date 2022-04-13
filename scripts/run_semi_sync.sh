@@ -70,6 +70,7 @@ function install_clone_plugin() {
         log "INFO" "Clone plugin is not installed. Installing the plugin..."
         retry 120 ${mysql} -e "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
         reading_first_time=1
+        retry 120 ${mysql} -e "reset master;"
         log "INFO" "Clone plugin successfully installed"
     else
         log "INFO" "Already clone plugin is installed"
