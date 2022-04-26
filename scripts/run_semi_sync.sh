@@ -120,6 +120,7 @@ function wait_for_mysqld_running() {
 
 # create mysql client with user exported in mysql_header and export password
 # this is to bypass the warning message for using password
+
 start_mysqld_in_background
 
 export mysql_header="mysql -u ${USER} --port=3306"
@@ -130,5 +131,17 @@ wait_for_mysqld_running
 install_clone_plugin "localhost"
 
 install_semiSync_plugin "localhost"
-log "INFO" "waiting for mysql process $pid."
-wait $pid
+
+while true; do
+    kill -0 $pid
+    exit="$?"
+    if [[ "$exit" == "0" ]]; then
+        echo "mysqld process is running"
+    else
+        echo "need to start mysqld and wait_for_mysqld_running"
+        start_mysqld_in_background
+        wait_for_mysqld_running
+    fi
+    log "INFO" "waiting for mysql process $pid."
+    wait $pid
+done
