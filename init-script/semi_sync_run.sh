@@ -10,4 +10,4 @@ if [ ! -d "/var/lib/mysql/raftwal" ]; then
     # move all files into the data directory
     mv $(ls | grep -wv 'data') data/
 fi
-echo "complete initialization"
+echo "complete initialization."
