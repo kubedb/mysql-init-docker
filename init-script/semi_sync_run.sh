@@ -1,6 +1,7 @@
 #!/bin/sh
 
 rm -rf /var/lib/mysql/lost+found
+rm -rf /var/lib/mysql/data/lost+found
 rm -rf /run-scripts/*
 cp /tmp/scripts/* /scripts
 
