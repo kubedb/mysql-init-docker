@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-
+args=$@
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
 localhost=127.0.0.1
@@ -53,7 +53,7 @@ EOL
 export pid
 
 function start_mysqld_in_background() {
-    log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld ${args[@]}'..."
+    log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
     docker-entrypoint.sh mysqld $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
