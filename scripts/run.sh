@@ -90,9 +90,9 @@ fi
 whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
 if [ -z "$whitelist" ]; then
     if [[ "$POD_IP_TYPE" == "IPv6" ]]; then
-        whitelist="$POD_IP"/64
+        whitelist="$POD_IP"/32
     else
-        whitelist="$POD_IP"/16
+        whitelist="$POD_IP"/8
     fi
 fi
 
@@ -188,7 +188,7 @@ function create_replication_user() {
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user........"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
-        retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
+        retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
         #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning process
         # https://dev.mysql.com/doc/refman/8.0/en/group-replication-cloning.html
@@ -198,7 +198,7 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
 
-        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
+        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
         retry 120 ${mysql} -N -e "RESET MASTER;"
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
@@ -380,7 +380,7 @@ function join_into_cluster() {
         if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $report_host....."
-                error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
+                error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;" 2>&1)
                 # we may get an error when the cloning process has finished like:
                 # ".ERROR 3707 (HY000) at line 1: Restart server failed (mysqld is not managed by supervisor process)"
                 # This error does not indicate a cloning failure.
