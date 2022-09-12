@@ -213,6 +213,18 @@ function rejoin_in_cluster() {
     done
 }
 
+function join_by_clone() {
+    log "INFO " "$report_host joining in cluster"
+    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    retry 10 ${mysqlshell} -e "cluster = dba.getCluster();cluster.removeInstance('$report_host',{force:'true'});"
+    retry 10 ${mysqlshell} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}@${report_host}',{password:'${MYSQL_ROOT_PASSWORD}',recoveryMethod:'clone',exitStateAction:'OFFLINE_MODE'});"
+
+    #this is required for clone method
+    # Prevent creation of new process until this one is finished
+    #https://serverfault.com/questions/477448/mysql-keeps-crashing-innodb-unable-to-lock-ibdata1-error-11
+#    wait $pid
+}
+
 export pid
 function reboot_from_completeOutage() {
     local mysqlshell="mysqlsh -u${replication_user} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
@@ -297,6 +309,13 @@ while true; do
         if [[ "$joined_in_cluster" == "0" ]]; then
             join_in_cluster
         fi
+    fi
+    if [[ $desired_func == "join_by_clone" ]]; then
+        select_primary
+        join_by_clone
+#        start_mysqld_in_background
+#        wait_for_host_online "repl" "$report_host" "$MYSQL_ROOT_PASSWORD"
+#        join_in_cluster
     fi
 
     if [[ $desired_func == "reboot_from_complete_outage" ]]; then

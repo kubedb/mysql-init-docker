@@ -428,6 +428,68 @@ function join_into_cluster() {
     echo "end join in cluster"
 }
 
+function join_by_clone() {
+    # member try to join into the existing group
+    log "INFO" "The replica, ${report_host} is joining into the existing group..."
+    local mysql="$mysql_header --host=$localhost"
+
+    # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
+    # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
+    # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
+    export mysqld_alive=1
+    log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
+    retry 120 ${mysql} -N -e "RESET MASTER;"
+    # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
+    if [[ $valid_donor_found == 1 ]]; then
+        for donor in ${donors[*]}; do
+            log "INFO" "Cloning data from $donor to $report_host....."
+            error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;" 2>&1)
+            # we may get an error when the cloning process has finished like:
+            # ".ERROR 3707 (HY000) at line 1: Restart server failed (mysqld is not managed by supervisor process)"
+            # This error does not indicate a cloning failure.
+            # It means that the recipient MySQL server instance must be started again manually after the data is cloned
+            # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
+            log "INFO" "Clone error message: $error_message"
+            if [[ "$error_message" != *"mysqld is not managed by supervisor process"* ]]; then
+                # retry cloning process for next valid donor
+                continue
+            fi
+
+            # wait for background process `mysqld` have been killed
+            for i in {120..0}; do
+                kill -0 $pid
+                exit="$?"
+                log "INFO" "Attempt $i: Checking mysqld(process id=$pid) is alive or not, exit code: $exit"
+                if [[ "$exit" != "0" ]]; then
+                    mysqld_alive=0
+                    break
+                fi
+                echo -n .
+                sleep 1
+            done
+
+            if [[ "$mysqld_alive" == "0" ]]; then
+                break
+            fi
+
+        done
+    fi
+    # If the host is still alive, it will join the cluster directly.
+    if [[ $mysqld_alive == 1 ]]; then
+        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        log "INFO" "Host (${report_host}) has joined to the group......."
+    else
+        #run mysqld in background since mysqld can't restart after a clone process
+        start_mysqld_in_background
+        wait_for_mysqld_running
+        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        log "INFO" "Host (${report_host}) has joined to the group......."
+        #
+    fi
+
+    echo "end join in cluster"
+}
+
 export pid
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
@@ -486,6 +548,12 @@ while true; do
         wait_for_primary "${member_hosts[*]}"
         set_valid_donors
         join_into_cluster
+    fi
+    if [[ $desired_func == "join_by_clone" ]]; then
+        check_member_list_updated "${member_hosts[*]}"
+        wait_for_primary "${member_hosts[*]}"
+        set_valid_donors
+        join_by_clone
     fi
     joining_for_first_time=0
     log "INFO" "waiting for mysql process id  = $pid"
