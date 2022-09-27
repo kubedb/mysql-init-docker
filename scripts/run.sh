@@ -102,7 +102,8 @@ fi
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
 mkdir -p /etc/mysql/group-replication.conf.d/
 echo "!includedir /etc/mysql/group-replication.conf.d/" >>/etc/mysql/my.cnf
-
+mkdir -p /etc/mysql/conf.d/
+echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 default-authentication-plugin=mysql_native_password
@@ -147,6 +148,7 @@ server_id = ${svr_id}
 bind-address = *
 report_host = "${report_host}"
 loose-group_replication_local_address = "${report_host}:33061"
+socket="/var/run/mysqld/mysqld.sock"
 EOL
 
 # wait for mysql daemon be running (alive)
