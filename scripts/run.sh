@@ -378,7 +378,7 @@ function join_into_cluster() {
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
-        # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
+        # clone process will run when the joiner get valid donor and the primary member's data will be be gather than or equal  128MB
         if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $report_host....."
@@ -441,7 +441,6 @@ function join_by_clone() {
     export mysqld_alive=1
     log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
     retry 120 ${mysql} -N -e "RESET MASTER;"
-    # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
     if [[ $valid_donor_found == 1 ]]; then
         for donor in ${donors[*]}; do
             log "INFO" "Cloning data from $donor to $report_host....."
