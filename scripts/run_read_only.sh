@@ -62,7 +62,11 @@ enforce_gtid_consistency = ON
 # Host specific replication configuration
 server_id = ${svr_id}
 bind-address = "0.0.0.0"
+socket="/var/run/mysqld/mysqld.sock"
 EOL
+
+mkdir -p /etc/mysql/conf.d/
+echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 
 export pid
 
@@ -117,7 +121,8 @@ function wait_for_mysqld_running() {
 function start_read_replica() {
     #stop_slave
     local mysql="$mysql_header --host=$localhost"
-
+    $mysql_header -e "stop slave;"
+    ssl_config=",SOURCE_SSL=0"
     if [[ "$source_ssl" == "true" ]]; then
         ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
         require_SSL="REQUIRE SSL"
