@@ -41,6 +41,7 @@ cat >>/etc/mysql/my.cnf <<EOL
 default_authentication_plugin=mysql_native_password
 #loose-group_replication_ip_whitelist = "${whitelist}"
 loose-group_replication_ip_allowlist = "${whitelist}"
+socket="/var/run/mysqld/mysqld.sock"
 EOL
 
 function retry {

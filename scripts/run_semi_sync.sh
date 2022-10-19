@@ -37,6 +37,9 @@ echo $BASE_NAME
 svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 11))
 log "INFO" "server_id =  $svr_id"
 
+mkdir -p /etc/mysql/conf.d/
+echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
+
 mkdir -p /etc/mysql/semi_sync.conf.d/
 echo "!includedir /etc/mysql/semi_sync.conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/semi_sync.conf.d/read.cnf <<EOL
@@ -48,6 +51,7 @@ gtid_mode = ON
 enforce_gtid_consistency = ON
 bind-address = "0.0.0.0"
 server_id = ${svr_id}
+socket="/var/run/mysqld/mysqld.sock"
 EOL
 
 export pid
