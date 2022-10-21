@@ -49,6 +49,9 @@ log "INFO" "server_id =  $svr_id"
 
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
 
+mkdir -p /etc/mysql/conf.d/
+echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
+
 mkdir -p /etc/mysql/read_only.conf.d/
 echo "!includedir /etc/mysql/read_only.conf.d/" >>/etc/mysql/my.cnf
 
