@@ -135,8 +135,8 @@ function configure_instance() {
 
 function create_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${report_host}"
-    clusterName=$(echo -n 'innodb-cluster' | sed 's/-/_/g')
-    retry 5 $mysqlshell -e "cluster=dba.createCluster('$clusterName',{exitStateAction:'ABORT_SERVER',autoRejoinTries:'2',consistency:'BEFORE_ON_PRIMARY_FAILOVER',manualStartOnBoot:'true'});"
+    clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
+    retry 5 $mysqlshell -e "cluster=dba.createCluster('$clusterName',{consistency:'BEFORE_ON_PRIMARY_FAILOVER',manualStartOnBoot:'true'});"
 }
 
 export primary=""
@@ -176,21 +176,14 @@ function is_already_in_cluster() {
 function join_in_cluster() {
     log "INFO " "$report_host joining in cluster"
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
-    retry 1 ${mysqlshell} -e "cluster = dba.getCluster();cluster.removeInstance('$report_host',{force:'true'});"
-    retry 10 ${mysqlshell} -e "cluster = dba.getCluster();cluster.addInstance('${replication_user}@${report_host}',{recoveryMethod:'incremental',exitStateAction:'ABORT_SERVER'});"
-
-    #this is required for clone method
-    # Prevent creation of new process until this one is finished
-    #https://serverfault.com/questions/477448/mysql-keeps-crashing-innodb-unable-to-lock-ibdata1-error-11
-    # wait $pid
-
+    retry 10 ${mysqlshell} -e "cluster = dba.getCluster();cluster.addInstance('${replication_user}@${report_host}',{recoveryMethod:'incremental'});"
 }
 
 function join_by_clone() {
     log "INFO " "$report_host joining in cluster"
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
     retry 10 ${mysqlshell} -e "cluster = dba.getCluster();cluster.removeInstance('$report_host',{force:'true'});"
-    retry 10 ${mysqlshell} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}@${report_host}',{recoveryMethod:'clone',exitStateAction:'ABORT_SERVER'});"
+    retry 10 ${mysqlshell} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}@${report_host}',{recoveryMethod:'clone'});"
 
     #this is required for clone method
     # Prevent creation of new process until this one is finished
@@ -225,6 +218,16 @@ function rejoin_in_cluster() {
             echo "$report_host successfully join_in_cluster"
         fi
     done
+    check_instance_joined_in_cluster
+    if [[ "$joined_in_cluster" == "0" ]]; then
+        make_sure_instance_join_in_cluster
+    fi
+    check_instance_joined_in_cluster
+    if [[ "$joined_in_cluster" == "0" ]]; then
+        retry 1 ${mysqlshell} -e "cluster = dba.getCluster();cluster.removeInstance('$report_host',{force:'true'});"
+        join_in_cluster
+    fi
+
 }
 
 export pid
@@ -232,8 +235,8 @@ function reboot_from_completeOutage() {
     local mysqlshell="mysqlsh -u${replication_user} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
     #https://dev.mysql.com/doc/dev/mysqlsh-api-javascript/8.0/classmysqlsh_1_1dba_1_1_dba.html#ac68556e9a8e909423baa47dc3b42aadb
     #mysql wait for user interaction to remove the unavailable seed from the cluster..
-    clusterName=$(echo -n 'innodb-cluster' | sed 's/-/_/g')
-    yes | $mysqlshell -e "dba.rebootClusterFromCompleteOutage('$clusterName',{user:'repl',rejoinInstances:['$report_host']})"
+    clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
+    yes | $mysqlshell -e "dba.rebootClusterFromCompleteOutage('$clusterName',{force:'true'})"
     yes | $mysqlshell -e "cluster = dba.getCluster();  cluster.rescan()"
     wait $pid
 }
@@ -304,14 +307,6 @@ while true; do
     if [[ $desired_func == "rejoin_in_cluster" ]]; then
         select_primary
         rejoin_in_cluster
-        check_instance_joined_in_cluster
-        if [[ "$joined_in_cluster" == "0" ]]; then
-            make_sure_instance_join_in_cluster
-        fi
-        check_instance_joined_in_cluster
-        if [[ "$joined_in_cluster" == "0" ]]; then
-            join_in_cluster
-        fi
     fi
     if [[ $desired_func == "join_by_clone" ]]; then
         select_primary
