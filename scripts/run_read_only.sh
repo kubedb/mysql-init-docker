@@ -2,7 +2,7 @@
 
 #   BASE_NAME           = name of the StatefulSet (same as the name of CRD)
 #   HOSTNAME            = name of the host | name of the pod (set by k8s)
-#   primaryHost         = primary dns of the source
+#   SOURCE_HOST         = primary dns of the source
 #   hostToConnect       = source dns
 
 env | sort | grep "POD\|HOST\|NAME"
@@ -11,8 +11,10 @@ args=$@
 
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
-localhost=127.0.0.1
 
+localhost=127.0.0.1
+report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
+echo "report_host = $report_host "
 function timestamp() {
     date +"%Y/%m/%d %T"
 }
@@ -44,7 +46,7 @@ function retry {
 }
 
 echo $BASE_NAME
-svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 11))
+svr_id=$(od -An -N2 -i /dev/urandom | awk '{print $1}')
 log "INFO" "server_id =  $svr_id"
 
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
@@ -66,6 +68,7 @@ enforce_gtid_consistency = ON
 server_id = ${svr_id}
 bind-address = "0.0.0.0"
 socket="/var/run/mysqld/mysqld.sock"
+report_host="$report_host"
 EOL
 
 mkdir -p /etc/mysql/conf.d/
@@ -83,7 +86,13 @@ function start_mysqld_in_background() {
 reading_first_time=0
 function install_clone_plugin() {
     log "INFO" "Checking whether clone plugin on host $1 is installed or not...."
-    local mysql="$mysql_header --host=$1"
+    ssl_config=""
+    if [[ "$1" == "$SOURCE_HOST" ]]; then
+        if [[ "$source_ssl" == "true" ]]; then
+            ssl_config="--ssl-ca=/etc/mysql/server/certs/ca.crt --ssl-cert=/etc/mysql/server/certs/tls.crt --ssl-key=/etc/mysql/server/certs/tls.key"
+        fi
+    fi
+    local mysql="mysql  --host=$1 --user=$2 --password=$3 --port=3306 $ssl_config"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep clone
@@ -100,16 +109,14 @@ function install_clone_plugin() {
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
-    local mysql="$mysql_header --host=$localhost"
+    local mysql="mysql -u ${USER} --port=3306 --password=${PASSWORD} --host=$localhost"
 
     for i in {900..0}; do
-        out=$(mysql -N -e "select 1;" 2>/dev/null)
+        out=$($mysql -N -e "select 1;" 2>/dev/null)
         log "INFO" "Attempt $i: Pinging '$report_host' has returned: '$out'...................................."
         if [[ "$out" == "1" ]]; then
             break
         fi
-
-        echo -n .
         sleep 1
     done
 
@@ -127,29 +134,31 @@ function start_read_replica() {
     $mysql_header -e "stop slave;"
     ssl_config=",SOURCE_SSL=0"
     if [[ "$source_ssl" == "true" ]]; then
-        ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt'"
+        ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt',SOURCE_SSL_CERT = '/etc/mysql/server/certs/tls.crt',SOURCE_SSL_KEY = '/etc/mysql/server/certs/tls.key'"
         require_SSL="REQUIRE SSL"
     fi
     echo $ssl_config
-    out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$hostToConnect',MASTER_PORT = 3306,MASTER_USER = '$USER',MASTER_PASSWORD = '$PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
+    out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$SOURCE_HOST',MASTER_PORT = 3306,MASTER_USER = '$SOURCE_USERNAME',MASTER_PASSWORD = '$SOURCE_PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
     echo $out
     sleep 1
     out=$($mysql_header -e "start slave;")
     echo $out
+
+    $mysql_header -e "set global super_read_only=ON"
 }
 
 # create mysql client with user exported in mysql_header and export password
 # this is to bypass the warning message for using password
 start_mysqld_in_background
 
-export mysql_header="mysql -u ${USER} --port=3306"
-export MYSQL_PWD=${PASSWORD}
+export mysql_header="mysql -u ${USER} --port=3306 --password=${PASSWORD}"
+#export MYSQL_PWD=${PASSWORD}
 
 wait_for_mysqld_running
 
-install_clone_plugin "localhost"
+install_clone_plugin "localhost" "$USER" "$PASSWORD"
 
-install_clone_plugin "$primaryHost"
+install_clone_plugin "$SOURCE_HOST" "$SOURCE_USERNAME" "$SOURCE_PASSWORD" $ssl_config
 
 while true; do
     kill -0 $pid
@@ -163,15 +172,14 @@ while true; do
     fi
 
     if [[ "$reading_first_time" == "1" ]]; then
-
-        $mysql_header -e "SET GLOBAL clone_valid_donor_list='$primaryHost:3306';"
-        error_message=$(${mysql_header} -e "CLONE INSTANCE FROM 'root'@'$primaryHost':3306 IDENTIFIED BY '$PASSWORD' $require_SSL;" 2>&1)
+        $mysql_header -e "set global super_read_only=OFF"
+        $mysql_header -e "SET GLOBAL clone_valid_donor_list='$SOURCE_HOST:3306';"
+        reading_first_time=0
+        error_message=$(${mysql_header} -e "CLONE INSTANCE FROM '$SOURCE_USERNAME'@'$SOURCE_HOST':3306 IDENTIFIED BY '$SOURCE_PASSWORD' $require_SSL;" 2>&1)
         # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
-        log "INFO" "Clone error message: $error_message"
     fi
-
     start_read_replica
     log "INFO" "waiting for mysql process id  = $pid"
-    reading_first_time=0
+
     wait $pid
 done
