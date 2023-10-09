@@ -46,7 +46,8 @@ function retry {
 }
 
 echo $BASE_NAME
-svr_id=$(od -An -N2 -i /dev/urandom | awk '{print $1}')
+svr_id=$(od -An -N3 -i /dev/urandom | awk '{print $1}')
+svr_id=${svr_id#-}
 log "INFO" "server_id =  $svr_id"
 
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
