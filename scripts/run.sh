@@ -188,12 +188,12 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
         retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
-
         retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
         retry 120 ${mysql} -N -e "RESET MASTER;"
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
     fi
+    touch /scripts/ready.txt
 }
 
 function install_group_replication_plugin() {
