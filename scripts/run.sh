@@ -187,6 +187,7 @@ function create_replication_user() {
     # if the user doesn't exist, crete new one.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user........"
+        retry 120 ${mysql} -N -e "RESET MASTER;"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
@@ -198,6 +199,7 @@ function create_replication_user() {
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
     fi
+    touch /scripts/ready.txt
 }
 
 function install_group_replication_plugin() {
