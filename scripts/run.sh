@@ -205,6 +205,7 @@ function create_replication_user() {
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
     fi
+    touch /scripts/ready.txt
 }
 
 function install_group_replication_plugin() {
