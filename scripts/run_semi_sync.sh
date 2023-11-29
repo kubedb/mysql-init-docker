@@ -104,7 +104,7 @@ function wait_for_mysqld_running() {
     local mysql="$mysql_header --host=$localhost"
 
     for i in {900..0}; do
-        out=$(mysql -N -e "select 1;" 2>/dev/null)
+        out=$(${mysql} -N -e "select 1;" 2>/dev/null)
         log "INFO" "Attempt $i: Pinging '$report_host' has returned: '$out'...................................."
         if [[ "$out" == "1" ]]; then
             break
