@@ -106,19 +106,14 @@ mkdir -p /etc/mysql/conf.d/
 echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
-default-authentication-plugin=mysql_native_password
+mysql_native_password=ON
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
 
 # General replication settings
 gtid_mode = ON
 enforce_gtid_consistency = ON
-master_info_repository = TABLE
-relay_log_info_repository = TABLE
 binlog_checksum = NONE
-log_slave_updates = ON
 log_bin = binlog
-binlog_format = ROW
-transaction_write_set_extraction = XXHASH64
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
 
@@ -200,8 +195,8 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
 
-        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
-        retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 120 ${mysql} -N -e "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
+        retry 120 ${mysql} -N -e "RESET REPLICA;"
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
     fi
@@ -360,7 +355,7 @@ function bootstrap_cluster() {
     local mysql="$mysql_header --host=$localhost"
     log "INFO" "bootstrapping cluster with host $report_host..."
     if [[ "$joining_for_first_time" == "1" ]]; then
-        retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 120 ${mysql} -N -e "RESET BINARY LOGS AND GTIDS;"
     fi
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
@@ -378,7 +373,7 @@ function join_into_cluster() {
     export mysqld_alive=1
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
-        retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 120 ${mysql} -N -e "RESET BINARY LOGS AND GTIDS;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather than or equal  128MB
         if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
             for donor in ${donors[*]}; do
@@ -441,7 +436,7 @@ function join_by_clone() {
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
     export mysqld_alive=1
     log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
-    retry 120 ${mysql} -N -e "RESET MASTER;"
+    retry 120 ${mysql} -N -e "RESET BINARY LOGS AND GTIDS;"
     if [[ $valid_donor_found == 1 ]]; then
         for donor in ${donors[*]}; do
             log "INFO" "Cloning data from $donor to $report_host....."
