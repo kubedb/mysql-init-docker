@@ -106,7 +106,6 @@ mkdir -p /etc/mysql/conf.d/
 echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
-mysql_native_password=ON
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
 
 # General replication settings
