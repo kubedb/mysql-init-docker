@@ -74,7 +74,7 @@ function install_clone_plugin() {
         log "INFO" "Clone plugin is not installed. Installing the plugin..."
         retry 120 ${mysql} -e "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
         reading_first_time=1
-        retry 120 ${mysql} -e "reset master;"
+        retry 120 ${mysql} -e "RESET BINARY LOGS AND GTIDS;"
         log "INFO" "Clone plugin successfully installed"
     else
         log "INFO" "Already clone plugin is installed"
@@ -90,8 +90,8 @@ function install_semiSync_plugin() {
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep semisync)
     if [[ -z "$out" ]]; then
         log "INFO" "semisync plugin is not installed. Installing the plugin..."
-        retry 120 ${mysql} -e "INSTALL PLUGIN rpl_semi_sync_master SONAME 'semisync_master.so';"
-        retry 120 ${mysql} -e "INSTALL PLUGIN rpl_semi_sync_slave SONAME 'semisync_slave.so';"
+        retry 120 ${mysql} -e "INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';"
+        retry 120 ${mysql} -e "INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';"
         reading_first_time=1
         log "INFO" "semi_sync plugin successfully installed"
     else
