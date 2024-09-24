@@ -270,28 +270,23 @@ function wait_for_primary() {
         cluster_size=${#members_id[@]}
 
         local is_primary_found=0
-        for member_id in ${members_id[*]}; do
-            for i in {60..0}; do
-                primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-                log "INFO" "Attempt $i: Trying to find primary member........................"
-                if [[ -n "$primary_member_id" ]]; then
-                    is_primary_found=1
-                    primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
-                    # calculate data size of the primary node.
-                    # https://forums.mysql.com/read.php?108,201578,201578
-                    primary_db_size=$(${mysql_header} --host=$primary_host -N -e 'select round(sum( data_length + index_length) / 1024 /  1024) "size in mb" from information_schema.tables;')
-                    log "INFO" "Primary found. Primary host: $primary_host, database size: $primary_db_size"
-                    break
-                fi
 
-                echo -n .
-                sleep 1
-            done
-
-            if [[ "$is_primary_found" == "1" ]]; then
+        for i in {20..0}; do
+            primary_member_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE' and MEMBER_ROLE = 'PRIMARY';" | awk '{print $2}')
+            log "INFO" "Attempt $i: Trying to find primary member........................"
+            if [[ -n "$primary_member_id" ]]; then
+              log "INFO" "Found the primary"
+                is_primary_found=1
+                primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
+                # calculate data size of the primary node.
+                # https://forums.mysql.com/read.php?108,201578,201578
+                primary_db_size=$(${mysql_header} --host=$primary_host -N -e 'select round(sum( data_length + index_length) / 1024 /  1024) "size in mb" from information_schema.tables;')
+                log "INFO" "Primary found. Primary host: $primary_host, database size: $primary_db_size"
                 break
             fi
 
+            echo -n .
+            sleep 1
         done
 
         if [[ "$is_primary_found" == "1" ]]; then
@@ -542,7 +537,7 @@ while true; do
 
     if [[ $desired_func == "join_in_cluster" ]]; then
         check_member_list_updated "${member_hosts[*]}"
-        wait_for_primary "${member_hosts[*]}"
+        # wait_for_primary "${member_hosts[*]}"
         set_valid_donors
         join_into_cluster
     fi
