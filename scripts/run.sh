@@ -537,7 +537,7 @@ while true; do
 
     if [[ $desired_func == "join_in_cluster" ]]; then
         check_member_list_updated "${member_hosts[*]}"
-        wait_for_primary "${member_hosts[*]}"
+        # wait_for_primary "${member_hosts[*]}"
         set_valid_donors
         join_into_cluster
     fi
