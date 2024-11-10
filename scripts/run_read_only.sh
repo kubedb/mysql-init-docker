@@ -132,17 +132,17 @@ function wait_for_mysqld_running() {
 function start_read_replica() {
     #stop_slave
     local mysql="$mysql_header --host=$localhost"
-    $mysql_header -e "stop slave;"
+    $mysql_header -e "stop replica;"
     ssl_config=",SOURCE_SSL=0"
     if [[ "$source_ssl" == "true" ]]; then
         ssl_config=",SOURCE_SSL=1,SOURCE_SSL_CA = '/etc/mysql/server/certs/ca.crt',SOURCE_SSL_CERT = '/etc/mysql/server/certs/tls.crt',SOURCE_SSL_KEY = '/etc/mysql/server/certs/tls.key'"
         require_SSL="REQUIRE SSL"
     fi
     echo $ssl_config
-    out=$($mysql_header -e "CHANGE SOURCE TO SOURCE_HOST = '$SOURCE_HOST',SOURCE_PORT = 3306,SOURCE_USER = '$SOURCE_USERNAME',SOURCE_PASSWORD = '$SOURCE_PASSWORD',SOURCE_AUTO_POSITION = 1 $ssl_config;")
+    out=$($mysql_header -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '$SOURCE_HOST',SOURCE_PORT = 3306,SOURCE_USER = '$SOURCE_USERNAME',SOURCE_PASSWORD = '$SOURCE_PASSWORD',SOURCE_AUTO_POSITION = 1 $ssl_config;")
     echo $out
     sleep 1
-    out=$($mysql_header -e "start slave;")
+    out=$($mysql_header -e "start replica;")
     echo $out
 
     $mysql_header -e "set global super_read_only=ON"
