@@ -139,7 +139,7 @@ function start_read_replica() {
         require_SSL="REQUIRE SSL"
     fi
     echo $ssl_config
-    out=$($mysql_header -e "CHANGE MASTER TO MASTER_HOST = '$SOURCE_HOST',MASTER_PORT = 3306,MASTER_USER = '$SOURCE_USERNAME',MASTER_PASSWORD = '$SOURCE_PASSWORD',MASTER_AUTO_POSITION = 1 $ssl_config;")
+    out=$($mysql_header -e "CHANGE SOURCE TO SOURCE_HOST = '$SOURCE_HOST',SOURCE_PORT = 3306,SOURCE_USER = '$SOURCE_USERNAME',SOURCE_PASSWORD = '$SOURCE_PASSWORD',SOURCE_AUTO_POSITION = 1 $ssl_config;")
     echo $out
     sleep 1
     out=$($mysql_header -e "start slave;")
