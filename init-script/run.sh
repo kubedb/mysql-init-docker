@@ -2,5 +2,10 @@
 
 rm -rf /var/lib/mysql/lost+found
 rm -rf /run-scripts/*
-rm /var/lib/mysql/auto.cnf
 cp /tmp/scripts/* /scripts
+if [[ "$PITR_RESTORE" == "true" ]]; then
+  if [[ "$HOSTNAME" != *"-0" ]]; then
+    rm /var/lib/mysql/auto.cnf
+  fi
+fi
+
