@@ -38,7 +38,6 @@ mkdir -p /etc/mysql/conf.d/
 cat >>/etc/mysql/my.cnf <<EOL
 !includedir /etc/mysql/conf.d/
 [mysqld]
-default_authentication_plugin=mysql_native_password
 #loose-group_replication_ip_whitelist = "${whitelist}"
 loose-group_replication_ip_allowlist = "${whitelist}"
 EOL

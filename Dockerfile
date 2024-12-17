@@ -18,6 +18,7 @@ LABEL org.opencontainers.image.source https://github.com/kubedb/mysql-init-docke
 RUN apk add --no-cache bash
 
 COPY scripts /tmp/scripts
+RUN chmod +x /tmp/scripts/*.sh
 COPY init-script /init-script
 COPY --from=0 /tini /tmp/scripts/tini
 

@@ -13,8 +13,24 @@
 #   HOST_ADDRESS_TYPE   = Address type of HOST_ADDRESS (one of DNS, IPV4, IPv6)
 #   POD_IP              = IP address used to create whitelist CIDR. For HOST_ADDRESS_TYPE=DNS, it will be status.PodIP.
 #   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
+#   PRIMARY_TYPE        = defines single/multi primary
 
 env | sort | grep "POD\|HOST\|NAME"
+RECOVERY_DONE_FILE="/tmp/recovery.done"
+if [[ "$PITR_RESTORE" == "true" ]]; then
+    while true; do
+      sleep 2
+      echo "Point In Time Recovery In Progress. Waiting for $RECOVERY_DONE_FILE file"
+      if [[ -e "$RECOVERY_DONE_FILE" ]]; then
+        echo "$RECOVERY_DONE_FILE found."
+        break
+      fi
+    done
+fi
+
+if [[ -e "$RECOVERY_DONE_FILE" ]]; then
+  rm $RECOVERY_DONE_FILE
+fi
 
 args=$@
 script_name=${0##*/}
@@ -104,6 +120,48 @@ mkdir -p /etc/mysql/group-replication.conf.d/
 echo "!includedir /etc/mysql/group-replication.conf.d/" >>/etc/mysql/my.cnf
 mkdir -p /etc/mysql/conf.d/
 echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
+if [[ "$PRIMARY_TYPE" == "Multi-Primary" ]]; then
+cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
+[mysqld]
+disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
+
+# General replication settings
+gtid_mode = ON
+enforce_gtid_consistency = ON
+binlog_checksum = NONE
+log_bin = binlog
+loose-group_replication_bootstrap_group = OFF
+loose-group_replication_start_on_boot = OFF
+
+# default tls configuration for the group
+# group_replication_recovery_use_ssl will be overwritten from DB arguments
+loose-group_replication_ssl_mode = REQUIRED
+loose-group_replication_recovery_use_ssl = 1
+
+# Shared replication group configuration
+loose-group_replication_group_name = "${GROUP_NAME}"
+#loose-group_replication_ip_whitelist = "${hosts}"
+#loose-group_replication_ip_whitelist = "AUTOMATIC"
+#loose-group_replication_ip_allowlist = "AUTOMATIC"
+loose-group_replication_ip_whitelist = "${whitelist}"
+loose-group_replication_ip_allowlist = "${whitelist}"
+loose-group_replication_group_seeds = "${seeds}"
+
+# Single or Multi-primary mode? Uncomment these two lines
+# for multi-primary mode, where any host can accept writes
+loose-group_replication_single_primary_mode = OFF
+loose-group_replication_enforce_update_everywhere_checks = ON
+
+# Host specific replication configuration
+server_id = ${svr_id}
+#bind-address = "${report_host}"
+#bind-address = "0.0.0.0"
+bind-address = *
+report_host = "${report_host}"
+loose-group_replication_local_address = "${report_host}:33061"
+socket="/var/run/mysqld/mysqld.sock"
+EOL
+else
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
@@ -144,6 +202,7 @@ report_host = "${report_host}"
 loose-group_replication_local_address = "${report_host}:33061"
 socket="/var/run/mysqld/mysqld.sock"
 EOL
+fi
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
