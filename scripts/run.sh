@@ -302,7 +302,7 @@ function check_member_list_updated() {
         if [[ "$report_host" == "$host" ]]; then
             continue
         fi
-        for i in {60..0}; do
+        for i in {20..0}; do
             alive_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
             alive_cluster_size=${#alive_members_id[@]}
             listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
