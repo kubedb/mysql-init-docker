@@ -113,7 +113,6 @@ if [ -z "$whitelist" ]; then
 fi
 
 innodb_buffer_pool_size="$INNODB_BUFFER_POOL_SIZE"
-group_replication_message_cache_size="$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
 
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
@@ -146,7 +145,6 @@ loose-group_replication_recovery_use_ssl = 1
 
 # recommended config
 innodb_buffer_pool_size = "${innodb_buffer_pool_size}"
-loose-group-replication-message-cache-size = "${group_replication_message_cache_size}"
 
 # Shared replication group configuration
 loose-group_replication_group_name = "${GROUP_NAME}"
