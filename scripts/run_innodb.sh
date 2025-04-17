@@ -37,8 +37,13 @@ fi
 innodb_buffer_pool_size="$INNODB_BUFFER_POOL_SIZE"
 group_replication_message_cache_size="$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
 mkdir -p /etc/mysql/conf.d/
+mkdir -p /etc/mysql/default.d/
 cat >>/etc/mysql/my.cnf <<EOL
+!includedir /etc/mysql/default.d/
 !includedir /etc/mysql/conf.d/
+EOL
+
+cat >>/etc/mysql/default.d/my.cnf <<EOL
 [mysqld]
 default_authentication_plugin=mysql_native_password
 #loose-group_replication_ip_whitelist = "${whitelist}"
@@ -51,7 +56,7 @@ EOL
 
 # recommended config
 if [ -v BINLOG_EXPIRE_LOGS_SECONDS ]; then
-  cat >>/etc/mysql/my.cnf <<EOL
+  cat >>/etc/mysql/default.d/my.cnf <<EOL
 binlog_expire_logs_seconds = "$BINLOG_EXPIRE_LOGS_SECONDS"
 EOL
 fi
