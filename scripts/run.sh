@@ -120,6 +120,7 @@ innodb_buffer_pool_size="$INNODB_BUFFER_POOL_SIZE"
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
 mkdir -p /etc/mysql/group-replication.conf.d/
 echo "!includedir /etc/mysql/group-replication.conf.d/" >>/etc/mysql/my.cnf
+echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
