@@ -111,8 +111,6 @@ if [ -z "$whitelist" ]; then
     fi
 fi
 
-innodb_buffer_pool_size="$INNODB_BUFFER_POOL_SIZE"
-group_replication_message_cache_size="$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
@@ -140,8 +138,9 @@ loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
 
 # recommended config
-innodb_buffer_pool_size = "${innodb_buffer_pool_size}"
-loose-group-replication-message-cache-size = "${group_replication_message_cache_size}"
+innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
+loose-group-replication-message-cache-size = "$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
+binlog_expire_logs_seconds = "$BINLOG_EXPIRE_LOGS_SECONDS"
 
 # default tls configuration for the group
 # group_replication_recovery_use_ssl will be overwritten from DB arguments
@@ -170,15 +169,7 @@ bind-address = *
 report_host = "${report_host}"
 loose-group_replication_local_address = "${report_host}:33061"
 socket="/var/run/mysqld/mysqld.sock"
-
 EOL
-
-# recommended config
-if [ -v BINLOG_EXPIRE_LOGS_SECONDS ]; then
-  cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
-binlog_expire_logs_seconds = "$BINLOG_EXPIRE_LOGS_SECONDS"
-EOL
-fi
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {

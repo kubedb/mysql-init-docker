@@ -34,8 +34,6 @@ if [ -z "$whitelist" ]; then
         whitelist="$POD_IP"/16
     fi
 fi
-innodb_buffer_pool_size="$INNODB_BUFFER_POOL_SIZE"
-group_replication_message_cache_size="$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
 mkdir -p /etc/mysql/conf.d/
 mkdir -p /etc/mysql/default.d/
 cat >>/etc/mysql/my.cnf <<EOL
@@ -50,16 +48,10 @@ default_authentication_plugin=mysql_native_password
 loose-group_replication_ip_allowlist = "${whitelist}"
 
 # recommended config
-innodb_buffer_pool_size = "${innodb_buffer_pool_size}"
-loose-group-replication-message-cache-size = "${group_replication_message_cache_size}"
-EOL
-
-# recommended config
-if [ -v BINLOG_EXPIRE_LOGS_SECONDS ]; then
-  cat >>/etc/mysql/default.d/my.cnf <<EOL
+innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
+loose-group-replication-message-cache-size = "$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
 binlog_expire_logs_seconds = "$BINLOG_EXPIRE_LOGS_SECONDS"
 EOL
-fi
 
 function retry {
     local retries="$1"
