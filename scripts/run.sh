@@ -112,8 +112,6 @@ if [ -z "$whitelist" ]; then
     whitelist="$POD_IP"/16
 fi
 
-innodb_buffer_pool_size="$INNODB_BUFFER_POOL_SIZE"
-
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
@@ -145,7 +143,8 @@ loose-group_replication_ssl_mode = REQUIRED
 loose-group_replication_recovery_use_ssl = 1
 
 # recommended config
-innodb_buffer_pool_size = "${innodb_buffer_pool_size}"
+innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
+expire_logs_days = "$EXPIRE_LOGS_DAYS"
 
 # Shared replication group configuration
 loose-group_replication_group_name = "${GROUP_NAME}"
@@ -165,13 +164,6 @@ bind-address = "0.0.0.0"
 report_host = "${report_host}"
 loose-group_replication_local_address = "${report_host}:33061"
 EOL
-
-# recommended config
-if [ -v EXPIRE_LOGS_DAYS ]; then
-  cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
-expire_logs_days = "$EXPIRE_LOGS_DAYS"
-EOL
-fi
 
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
