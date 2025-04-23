@@ -120,7 +120,6 @@ mkdir -p /etc/mysql/group-replication.conf.d/
 echo "!includedir /etc/mysql/group-replication.conf.d/" >>/etc/mysql/my.cnf
 mkdir -p /etc/mysql/conf.d/
 echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
-if [[ "$PRIMARY_TYPE" == "Multi-Primary" ]]; then
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
@@ -151,11 +150,6 @@ loose-group_replication_group_name = "${GROUP_NAME}"
 loose-group_replication_ip_whitelist = "${whitelist}"
 loose-group_replication_ip_allowlist = "${whitelist}"
 loose-group_replication_group_seeds = "${seeds}"
-
-# Single or Multi-primary mode? Uncomment these two lines
-# for multi-primary mode, where any host can accept writes
-loose-group_replication_single_primary_mode = OFF
-loose-group_replication_enforce_update_everywhere_checks = ON
 
 # Host specific replication configuration
 server_id = ${svr_id}
@@ -166,51 +160,13 @@ report_host = "${report_host}"
 loose-group_replication_local_address = "${report_host}:33061"
 socket="/var/run/mysqld/mysqld.sock"
 EOL
-else
+
+if [[ "$PRIMARY_TYPE" == "Multi-Primary" ]]; then
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
-disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
-
-# General replication settings
-gtid_mode = ON
-enforce_gtid_consistency = ON
-binlog_checksum = NONE
-log_bin = binlog
-loose-group_replication_bootstrap_group = OFF
-loose-group_replication_start_on_boot = OFF
-
-# default tls configuration for the group
-# group_replication_recovery_use_ssl will be overwritten from DB arguments
-loose-group_replication_ssl_mode = REQUIRED
-loose-group_replication_recovery_use_ssl = 1
-
-# recommended config
-innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
-loose-group-replication-message-cache-size = "$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
-binlog_expire_logs_seconds = "$BINLOG_EXPIRE_LOGS_SECONDS"
-
-# Shared replication group configuration
-loose-group_replication_group_name = "${GROUP_NAME}"
-#loose-group_replication_ip_whitelist = "${hosts}"
-#loose-group_replication_ip_whitelist = "AUTOMATIC"
-#loose-group_replication_ip_allowlist = "AUTOMATIC"
-loose-group_replication_ip_whitelist = "${whitelist}"
-loose-group_replication_ip_allowlist = "${whitelist}"
-loose-group_replication_group_seeds = "${seeds}"
-
-# Single or Multi-primary mode? Uncomment these two lines
 # for multi-primary mode, where any host can accept writes
-#loose-group_replication_single_primary_mode = OFF
-#loose-group_replication_enforce_update_everywhere_checks = ON
-
-# Host specific replication configuration
-server_id = ${svr_id}
-#bind-address = "${report_host}"
-#bind-address = "0.0.0.0"
-bind-address = *
-report_host = "${report_host}"
-loose-group_replication_local_address = "${report_host}:33061"
-socket="/var/run/mysqld/mysqld.sock"
+loose-group_replication_single_primary_mode = OFF
+loose-group_replication_enforce_update_everywhere_checks = ON
 EOL
 fi
 
