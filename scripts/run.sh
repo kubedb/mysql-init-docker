@@ -137,6 +137,11 @@ transaction_write_set_extraction = XXHASH64
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
 
+# recommended config
+innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
+loose-group-replication-message-cache-size = "$GROUP_REPLICATION_MESSAGE_CACHE_SIZE"
+binlog_expire_logs_seconds = "$BINLOG_EXPIRE_LOGS_SECONDS"
+
 # default tls configuration for the group
 # group_replication_recovery_use_ssl will be overwritten from DB arguments
 loose-group_replication_ssl_mode = REQUIRED
