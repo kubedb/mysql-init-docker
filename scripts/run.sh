@@ -118,6 +118,7 @@ fi
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
 mkdir -p /etc/mysql/group-replication.conf.d/
 echo "!includedir /etc/mysql/group-replication.conf.d/" >>/etc/mysql/my.cnf
+echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
@@ -140,6 +141,10 @@ loose-group_replication_start_on_boot = OFF
 # group_replication_recovery_use_ssl will be overwritten from DB arguments
 loose-group_replication_ssl_mode = REQUIRED
 loose-group_replication_recovery_use_ssl = 1
+
+# recommended config
+innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
+expire_logs_days = "$EXPIRE_LOGS_DAYS"
 
 # Shared replication group configuration
 loose-group_replication_group_name = "${GROUP_NAME}"
