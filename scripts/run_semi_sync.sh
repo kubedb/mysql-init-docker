@@ -106,7 +106,6 @@ function install_semiSync_plugin() {
         reading_first_time=1
         log "INFO" "semi_sync plugin successfully installed"
         if [[ "$replicaStop" == 1 ]]; then
-          retry 120 ${mysql} -e "SET GLOBAL rpl_semi_sync_replica_enabled = 1;"
           retry 120 ${mysql} -e "START REPLICA;"
         fi
     else
