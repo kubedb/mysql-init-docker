@@ -87,8 +87,8 @@ function install_semiSync_plugin() {
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
 
-    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep -E 'semisync_master|semisync_master'
-    out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep -E 'semisync_master|semisync_master')
+    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep 'semisync_master'
+    out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep 'semisync_master')
     replicaStop=0
     if [[ -n "$out" ]]; then
         log "INFO" "previous version plugin is installed. Uninstalling the plugin..."
