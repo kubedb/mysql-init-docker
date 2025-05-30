@@ -86,14 +86,28 @@ function install_semiSync_plugin() {
     local mysql="$mysql_header --host=$1"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
-    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep semisync
-    out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep semisync)
+
+    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep 'semisync_master'
+    out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep 'semisync_master')
+    replicaStop=0
+    if [[ -n "$out" ]]; then
+        log "INFO" "previous version plugin is installed. Uninstalling the plugin..."
+        retry 120 ${mysql} -e "STOP REPLICA;"
+        retry 120 ${mysql} -e "UNINSTALL PLUGIN rpl_semi_sync_master;"
+        retry 120 ${mysql} -e "UNINSTALL PLUGIN rpl_semi_sync_slave;"
+        replicaStop=1
+    fi
+    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep semisync_source
+    out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep semisync_source)
     if [[ -z "$out" ]]; then
         log "INFO" "semisync plugin is not installed. Installing the plugin..."
         retry 120 ${mysql} -e "INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';"
         retry 120 ${mysql} -e "INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';"
         reading_first_time=1
         log "INFO" "semi_sync plugin successfully installed"
+        if [[ "$replicaStop" == 1 ]]; then
+          retry 120 ${mysql} -e "START REPLICA;"
+        fi
     else
         log "INFO" "Already semi_sync plugin is installed"
     fi
