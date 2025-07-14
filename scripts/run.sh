@@ -212,8 +212,11 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "RESET MASTER;"
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
+        # Update replication channel password if it has been changed via RotateAuth
+        retry 120 ${mysql} -N -e "stop group_replication;"
+        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
+        retry 120 ${mysql} -N -e "start group_replication;"
     fi
-
     touch /scripts/ready.txt
 }
 
