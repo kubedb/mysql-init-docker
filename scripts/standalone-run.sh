@@ -1,6 +1,6 @@
-#!/bin/sh
+#!/bin/bash
 
-if [[ -z "$TOPOLOGY" ]]; then
+if [[ "$TOPOLOGY" == "" ]]; then
   RECOVERY_DONE_FILE="/tmp/recovery.done"
   if [[ "$PITR_RESTORE" == "true" ]]; then
     while true; do
