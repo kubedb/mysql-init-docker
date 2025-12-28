@@ -18,17 +18,17 @@ env | sort | grep "POD\|HOST\|NAME"
 RECOVERY_DONE_FILE="/tmp/recovery.done"
 if [[ "$PITR_RESTORE" == "true" ]]; then
     while true; do
-      sleep 2
-      echo "Point In Time Recovery In Progress. Waiting for $RECOVERY_DONE_FILE file"
-      if [[ -e "$RECOVERY_DONE_FILE" ]]; then
-        echo "$RECOVERY_DONE_FILE found."
-        break
-      fi
+        sleep 2
+        echo "Point In Time Recovery In Progress. Waiting for $RECOVERY_DONE_FILE file"
+        if [[ -e "$RECOVERY_DONE_FILE" ]]; then
+            echo "$RECOVERY_DONE_FILE found."
+            break
+        fi
     done
 fi
 
 if [[ -e "$RECOVERY_DONE_FILE" ]]; then
-  rm $RECOVERY_DONE_FILE
+    rm $RECOVERY_DONE_FILE
 fi
 
 args=$@
@@ -225,7 +225,7 @@ function create_replication_user() {
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
         # Update replication channel password if it has been changed via RotateAuth
-          retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
+        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
     fi
     touch /scripts/ready.txt
 }
