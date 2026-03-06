@@ -266,12 +266,18 @@ function install_clone_plugin() {
 }
 
 function check_member_list_updated() {
+
     for host in $@; do
         local mysql="$mysql_header --host=$host"
         if [[ "$report_host" == "$host" ]]; then
             continue
         fi
         for i in {60..0}; do
+            kill -0 $pid
+            exit="$?"
+            if [[ "$exit" != "0" ]]; then
+              break
+            fi
             alive_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
             alive_cluster_size=${#alive_members_id[@]}
             listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
@@ -299,6 +305,11 @@ function wait_for_primary() {
         local is_primary_found=0
         for member_id in ${members_id[*]}; do
             for i in {60..0}; do
+                kill -0 $pid
+                exit="$?"
+                if [[ "$exit" != "0" ]]; then
+                  break
+                fi
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
                 log "INFO" "Attempt $i: Trying to find primary member........................"
                 if [[ -n "$primary_member_id" ]]; then
@@ -330,6 +341,11 @@ function wait_for_primary() {
 # declare donors array for further use
 declare -a donors
 function set_valid_donors() {
+    kill -0 $pid
+    exit="$?"
+    if [[ "$exit" != "0" ]]; then
+      return
+    fi
     log "INFO" "Checking whether valid donor is found or not. If found, set this to 'clone_valid_donor_list'"
     local mysql="$mysql_header --host=$localhost"
     # clone process run when the donor and recipient must have the same MySQL server version and
