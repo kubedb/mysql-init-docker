@@ -136,6 +136,7 @@ binlog_format = ROW
 transaction_write_set_extraction = XXHASH64
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
+loose_group_replication_unreachable_majority_timeout = 20
 
 # recommended config
 innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
