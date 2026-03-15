@@ -49,6 +49,7 @@ function log() {
 }
 
 function retry {
+
     local retries="$1"
     shift
 
@@ -64,6 +65,10 @@ function retry {
             return $exit
         fi
         count=$(($count + 1))
+        retryfile="/scripts/retry-off"
+        if [ -e "$retryfile" ]; then
+            return 0
+        fi
     done
     return 0
 }
@@ -433,7 +438,7 @@ function join_into_cluster() {
     fi
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        retry 10 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
@@ -532,7 +537,7 @@ wait_for_mysqld_running
 # ensure replication user
 create_replication_user
 
-# ensure replication plugin
+# ensure replication plugingit
 install_group_replication_plugin
 
 # ensure clone plugin
@@ -563,7 +568,7 @@ while true; do
 
     if [[ $desired_func == "join_in_cluster" ]]; then
         check_member_list_updated "${member_hosts[*]}"
-        # wait_for_primary "${member_hosts[*]}"
+        wait_for_primary "${member_hosts[*]}"
         set_valid_donors
         join_into_cluster
     fi
