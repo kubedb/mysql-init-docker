@@ -65,7 +65,7 @@ function retry {
             return $exit
         fi
         count=$(($count + 1))
-        retryfile="/scripts/retry-off"
+        retryfile="/scripts/retry-stop"
         if [ -e "$retryfile" ]; then
             return 0
         fi
@@ -84,7 +84,7 @@ IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
 
-report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
+report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE"
 echo "report_host = $report_host "
 
 # comma separated host names
@@ -303,7 +303,7 @@ function wait_for_primary() {
         local is_primary_found=0
 
         for i in {20..0}; do
-            primary_member_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE' and MEMBER_ROLE = 'PRIMARY';" | awk '{print $2}')
+            primary_member_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE' and MEMBER_ROLE = 'PRIMARY';" | awk '{print $1}')
             log "INFO" "Attempt $i: Trying to find primary member, from ${host}........................"
             if [[ -n "$primary_member_id" ]]; then
               log "INFO" "Found the primary"
@@ -537,7 +537,7 @@ wait_for_mysqld_running
 # ensure replication user
 create_replication_user
 
-# ensure replication plugingit
+# ensure replication plugin
 install_group_replication_plugin
 
 # ensure clone plugin
