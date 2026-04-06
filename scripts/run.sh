@@ -211,26 +211,30 @@ function create_replication_user() {
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 60 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
     out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-    # if the user doesn't exist, crete new one.
+    # if the user doesn't exist, create new one.
+    # All operations run in a SINGLE session with SQL_LOG_BIN=0 to prevent
+    # writing local GTIDs that would create errant transactions on rejoin.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user........"
-        retry 60 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
-        retry 60 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;"
-        retry 60 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning process
-        # https://dev.mysql.com/doc/refman/8.0/en/group-replication-cloning.html
-        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
-        retry 60 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';"
-        retry 60 ${mysql} -N -e "GRANT CLONE_ADMIN ON *.* TO 'repl'@'%';"
-        retry 60 ${mysql} -N -e "FLUSH PRIVILEGES;"
-        retry 60 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
-
-        retry 60 ${mysql} -N -e "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
-        retry 60 ${mysql} -N -e "RESET REPLICA;"
+        retry 60 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;
+            GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+            GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';
+            GRANT CLONE_ADMIN ON *.* TO 'repl'@'%';
+            FLUSH PRIVILEGES;
+            CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
+            RESET REPLICA;
+            SET SQL_LOG_BIN=1;
+        "
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
         # Update replication channel password if it has been changed via RotateAuth
-        retry 60 ${mysql} -N -e "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
+        retry 60 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
+            SET SQL_LOG_BIN=1;
+        "
     fi
     touch /scripts/ready.txt
 }
@@ -247,7 +251,7 @@ function install_group_replication_plugin() {
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
         # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
         joining_for_first_time=1
-        retry 60 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
+        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; INSTALL PLUGIN group_replication SONAME 'group_replication.so'; SET SQL_LOG_BIN=1;"
         log "INFO" "Group replication plugin successfully installed"
     else
         log "INFO" "Already group replication plugin is installed"
@@ -263,7 +267,7 @@ function install_clone_plugin() {
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep clone)
     if [[ -z "$out" ]]; then
         log "INFO" "Clone plugin is not installed. Installing the plugin..."
-        retry 60 ${mysql} -e "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
+        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; INSTALL PLUGIN clone SONAME 'mysql_clone.so'; SET SQL_LOG_BIN=1;"
         log "INFO" "Clone plugin successfully installed"
     else
         log "INFO" "Already clone plugin is installed"
