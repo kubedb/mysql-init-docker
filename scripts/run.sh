@@ -126,6 +126,8 @@ echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 default-authentication-plugin=mysql_native_password
+log_error_suppression_list = 'MY-013360' #remove this message "Plugin mysql_native_password reported: ''mysql_native_password' is deprecated and will be removed in a future release. Please use caching_sha2_password instead'"
+#log_error_suppression_list = 'MY-013360,MY-011873,MY-011879'   # NUMA related warnings
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
 
 # General replication settings
