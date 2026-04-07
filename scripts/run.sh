@@ -199,6 +199,12 @@ function wait_for_mysqld_running() {
         exit 1
     fi
     log "INFO" "mysql daemon is ready to use......."
+
+    # Set read-only immediately after MySQL starts to prevent any external
+    # process (e.g. KubeDB health checker) from writing local GTIDs before
+    # the node joins GR. Cannot be set in my.cnf because it blocks --initialize.
+    ${mysql} -N -e "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" 2>/dev/null
+    log "INFO" "Set super_read_only=ON to prevent errant GTIDs"
 }
 
 function create_replication_user() {
@@ -220,6 +226,8 @@ function create_replication_user() {
         log "INFO" "Replication user not found. Creating new replication user........"
         retry 60 ${mysql} -N -e "
             SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
             CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;
             GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
             GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';
@@ -227,6 +235,8 @@ function create_replication_user() {
             FLUSH PRIVILEGES;
             CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
             RESET MASTER;
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
             SET SQL_LOG_BIN=1;
         "
     else
@@ -234,7 +244,11 @@ function create_replication_user() {
         # Update replication channel password if it has been changed via RotateAuth
         retry 60 ${mysql} -N -e "
             SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
             CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
             SET SQL_LOG_BIN=1;
         "
     fi
@@ -253,7 +267,7 @@ function install_group_replication_plugin() {
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
         # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
         joining_for_first_time=1
-        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; INSTALL PLUGIN group_replication SONAME 'group_replication.so'; SET SQL_LOG_BIN=1;"
+        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; INSTALL PLUGIN group_replication SONAME 'group_replication.so'; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SET SQL_LOG_BIN=1;"
         log "INFO" "Group replication plugin successfully installed"
     else
         log "INFO" "Already group replication plugin is installed"
@@ -269,7 +283,7 @@ function install_clone_plugin() {
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep clone)
     if [[ -z "$out" ]]; then
         log "INFO" "Clone plugin is not installed. Installing the plugin..."
-        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; INSTALL PLUGIN clone SONAME 'mysql_clone.so'; SET SQL_LOG_BIN=1;"
+        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; INSTALL PLUGIN clone SONAME 'mysql_clone.so'; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SET SQL_LOG_BIN=1;"
         log "INFO" "Clone plugin successfully installed"
     else
         log "INFO" "Already clone plugin is installed"
@@ -408,6 +422,9 @@ function bootstrap_cluster() {
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=$localhost"
     log "INFO" "bootstrapping cluster with host $report_host..."
+    # Temporarily disable read-only for bootstrap operations.
+    # GR will manage read-only after START GROUP_REPLICATION.
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
     if [[ "$joining_for_first_time" == "1" ]]; then
         retry 60 ${mysql} -N -e "RESET MASTER;"
     fi
@@ -420,6 +437,10 @@ function join_into_cluster() {
     # member try to join into the existing group
     log "INFO" "The replica, ${report_host} is joining into the existing group..."
     local mysql="$mysql_header --host=$localhost"
+
+    # Temporarily disable read-only for join operations.
+    # GR will manage read-only after START GROUP_REPLICATION.
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
@@ -484,6 +505,10 @@ function join_by_clone() {
     # member try to join into the existing group
     log "INFO" "The replica, ${report_host} is joining into the existing group..."
     local mysql="$mysql_header --host=$localhost"
+
+    # Temporarily disable read-only for clone operations.
+    # GR will manage read-only after START GROUP_REPLICATION.
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
