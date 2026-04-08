@@ -73,6 +73,10 @@ function retry {
             return $exit
         fi
         count=$(($count + 1))
+        retryfile="/scripts/retry-stop"
+        if [ -e "$retryfile" ]; then
+            return 0
+        fi
     done
     return 0
 }
@@ -88,8 +92,8 @@ IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
 
-report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
-echo "report_host = $report_host "
+report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE"
+echo "report_host = $report_host"
 
 # comma separated host names
 export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
@@ -136,6 +140,7 @@ binlog_format = ROW
 transaction_write_set_extraction = XXHASH64
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
+loose_group_replication_unreachable_majority_timeout = 20
 
 # default tls configuration for the group
 # group_replication_recovery_use_ssl will be overwritten from DB arguments
@@ -186,6 +191,12 @@ function wait_for_mysqld_running() {
         exit 1
     fi
     log "INFO" "mysql daemon is ready to use......."
+
+    # Set read-only immediately after MySQL starts to prevent any external
+    # process (e.g. KubeDB health checker) from writing local GTIDs before
+    # the node joins GR. Cannot be set in my.cnf because it blocks --initialize.
+    ${mysql} -N -e "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" 2>/dev/null
+    log "INFO" "Set super_read_only=ON to prevent errant GTIDs"
 }
 
 function create_replication_user() {
@@ -198,22 +209,38 @@ function create_replication_user() {
     local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
-    retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
+    retry 60 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
     out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-    # if the user doesn't exist, crete new one.
+    # if the user doesn't exist, create new one.
+    # All operations run in a SINGLE session with SQL_LOG_BIN=0 to prevent
+    # writing local GTIDs that would create errant transactions on rejoin.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user........"
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
-        retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;"
-        retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
-        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
-        retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 60 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
+            CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;
+            GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+            FLUSH PRIVILEGES;
+            CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
+            RESET MASTER;
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
+            SET SQL_LOG_BIN=1;
+        "
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
         # Update replication channel password if it has been changed via RotateAuth
-        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
+        retry 60 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
+            CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
+            SET SQL_LOG_BIN=1;
+        "
     fi
     touch /scripts/ready.txt
 }
@@ -223,12 +250,12 @@ function install_group_replication_plugin() {
     local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
-    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
+    retry 60 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
         log "INFO" "Group replication plugin is not installed. Installing the plugin...."
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
-        retry 120 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
+        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; INSTALL PLUGIN group_replication SONAME 'group_replication.so'; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SET SQL_LOG_BIN=1;"
         log "INFO" "Group replication plugin successfully installed"
     else
         log "INFO" "Already group replication plugin is installed"
@@ -255,20 +282,30 @@ function check_existing_cluster() {
 }
 
 function check_member_list_updated() {
-    echo $report_host
     for host in $@; do
         local mysql="$mysql_header --host=$host"
         if [[ "$report_host" == "$host" ]]; then
             continue
         fi
-        for i in {60..0}; do
-            echo $host
-            alive_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
-            alive_cluster_size=${#alive_members_id[@]}
-            listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
-            cluster_size=${#listed_members_id[@]}
-            log "INFO" "Attempt $i: Checking member list has been updated inside host: $host. Expected online member: $cluster_size. Found: $alive_cluster_size"
-            if [[ "$alive_cluster_size" -eq "$cluster_size" ]]; then
+        for i in {120..0}; do
+            kill -0 $pid
+            exit="$?"
+            if [[ "$exit" != "0" ]]; then
+              break
+            fi
+            alive_cluster_size=$(${mysql} -N -e "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';" 2>/dev/null || echo "0")
+            cluster_size=$(${mysql} -N -e "SELECT COUNT(*) FROM performance_schema.replication_group_members;" 2>/dev/null || echo "0")
+
+            log "INFO" "Attempt $i: Checking member list on $host. Total: $cluster_size, Online: $alive_cluster_size"
+
+            # Node still joining (sees only itself as OFFLINE)
+            if [[ "$cluster_size" -le "1" ]]; then
+                log "INFO" "Node $host still joining (sees $cluster_size member). Waiting..."
+                break
+            fi
+
+            # Success: all members ONLINE and at least 1 member
+            if [[ "$alive_cluster_size" -gt "0" && "$alive_cluster_size" -eq "$cluster_size" ]]; then
                 break
             fi
             sleep 1
