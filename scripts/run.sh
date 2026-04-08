@@ -63,6 +63,10 @@ function retry {
             return $exit
         fi
         count=$(($count + 1))
+        retryfile="/scripts/retry-stop"
+        if [ -e "$retryfile" ]; then
+            return 0
+        fi
     done
     return 0
 }
@@ -78,8 +82,8 @@ IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
 
-report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
-echo "report_host = $report_host "
+report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE"
+echo "report_host = $report_host"
 
 # comma separated host names
 export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
@@ -122,6 +126,8 @@ echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 default-authentication-plugin=mysql_native_password
+log_error_suppression_list = 'MY-013360' #remove this message "Plugin mysql_native_password reported: ''mysql_native_password' is deprecated and will be removed in a future release. Please use caching_sha2_password instead'"
+#log_error_suppression_list = 'MY-013360,MY-011873,MY-011879'   # NUMA related warnings
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
 
 # General replication settings
@@ -136,6 +142,7 @@ binlog_format = ROW
 transaction_write_set_extraction = XXHASH64
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
+loose_group_replication_unreachable_majority_timeout = 20
 
 # recommended config
 innodb_buffer_pool_size = "$INNODB_BUFFER_POOL_SIZE"
@@ -192,6 +199,12 @@ function wait_for_mysqld_running() {
         exit 1
     fi
     log "INFO" "mysql daemon is ready to use......."
+
+    # Set read-only immediately after MySQL starts to prevent any external
+    # process (e.g. KubeDB health checker) from writing local GTIDs before
+    # the node joins GR. Cannot be set in my.cnf because it blocks --initialize.
+    ${mysql} -N -e "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" 2>/dev/null
+    log "INFO" "Set super_read_only=ON to prevent errant GTIDs"
 }
 
 function create_replication_user() {
@@ -204,28 +217,40 @@ function create_replication_user() {
     local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
-    retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
+    retry 60 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
     out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-    # if the user doesn't exist, crete new one.
+    # if the user doesn't exist, create new one.
+    # All operations run in a SINGLE session with SQL_LOG_BIN=0 to prevent
+    # writing local GTIDs that would create errant transactions on rejoin.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user........"
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
-        retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;"
-        retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning process
-        # https://dev.mysql.com/doc/refman/8.0/en/group-replication-cloning.html
-        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
-        retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';"
-        retry 120 ${mysql} -N -e "GRANT CLONE_ADMIN ON *.* TO 'repl'@'%';"
-        retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
-
-        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
-        retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 60 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
+            CREATE USER 'repl'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;
+            GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+            GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';
+            GRANT CLONE_ADMIN ON *.* TO 'repl'@'%';
+            FLUSH PRIVILEGES;
+            CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
+            RESET MASTER;
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
+            SET SQL_LOG_BIN=1;
+        "
     else
         log "INFO" "Replication user exists. Skipping creating new one......."
         # Update replication channel password if it has been changed via RotateAuth
-          retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
+        retry 60 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
+            CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
+            SET SQL_LOG_BIN=1;
+        "
     fi
     touch /scripts/ready.txt
 }
@@ -235,14 +260,14 @@ function install_group_replication_plugin() {
     local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
-    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
+    retry 60 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
         log "INFO" "Group replication plugin is not installed. Installing the plugin...."
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
         # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
         joining_for_first_time=1
-        retry 120 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
+        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; INSTALL PLUGIN group_replication SONAME 'group_replication.so'; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SET SQL_LOG_BIN=1;"
         log "INFO" "Group replication plugin successfully installed"
     else
         log "INFO" "Already group replication plugin is installed"
@@ -254,11 +279,11 @@ function install_clone_plugin() {
     local mysql="$mysql_header --host=$localhost"
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
-    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep clone
+    retry 60 ${mysql} -N -e 'SHOW PLUGINS;' | grep clone
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep clone)
     if [[ -z "$out" ]]; then
         log "INFO" "Clone plugin is not installed. Installing the plugin..."
-        retry 120 ${mysql} -e "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
+        retry 60 ${mysql} -e "SET SQL_LOG_BIN=0; SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; INSTALL PLUGIN clone SONAME 'mysql_clone.so'; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SET SQL_LOG_BIN=1;"
         log "INFO" "Clone plugin successfully installed"
     else
         log "INFO" "Already clone plugin is installed"
@@ -266,12 +291,18 @@ function install_clone_plugin() {
 }
 
 function check_member_list_updated() {
+
     for host in $@; do
         local mysql="$mysql_header --host=$host"
         if [[ "$report_host" == "$host" ]]; then
             continue
         fi
         for i in {60..0}; do
+            kill -0 $pid
+            exit="$?"
+            if [[ "$exit" != "0" ]]; then
+              break
+            fi
             alive_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
             alive_cluster_size=${#alive_members_id[@]}
             listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
@@ -299,8 +330,13 @@ function wait_for_primary() {
         local is_primary_found=0
         for member_id in ${members_id[*]}; do
             for i in {60..0}; do
+                kill -0 $pid
+                exit="$?"
+                if [[ "$exit" != "0" ]]; then
+                  break
+                fi
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-                log "INFO" "Attempt $i: Trying to find primary member........................"
+                log "INFO" "Attempt $i: Trying to find primary member, from ${host}........................"
                 if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
@@ -330,6 +366,11 @@ function wait_for_primary() {
 # declare donors array for further use
 declare -a donors
 function set_valid_donors() {
+    kill -0 $pid
+    exit="$?"
+    if [[ "$exit" != "0" ]]; then
+      return
+    fi
     log "INFO" "Checking whether valid donor is found or not. If found, set this to 'clone_valid_donor_list'"
     local mysql="$mysql_header --host=$localhost"
     # clone process run when the donor and recipient must have the same MySQL server version and
@@ -337,7 +378,7 @@ function set_valid_donors() {
     report_host_version=$(${mysql} -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
 
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
-    retry 120 ${mysql_header} --host=$primary_host -N -e "SELECT * FROM performance_schema.replication_group_members;"
+    retry 60 ${mysql_header} --host=$primary_host -N -e "SELECT * FROM performance_schema.replication_group_members;"
 
     donor_list=$(${mysql_header} --host=$primary_host -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';")
 
@@ -367,7 +408,7 @@ function set_valid_donors() {
         valid_donors=$(echo -n ${donors[*]} | sed -e "s/ /:3306,/g" && echo -n ":3306")
         log "INFO" "Valid donors found. The list of valid donor are: ${valid_donors}"
         # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-options-variables.html#sysvar_clone_valid_donor_list
-        retry 120 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='${valid_donors}';"
+        retry 60 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='${valid_donors}';"
     fi
 }
 
@@ -381,12 +422,15 @@ function bootstrap_cluster() {
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=$localhost"
     log "INFO" "bootstrapping cluster with host $report_host..."
+    # Temporarily disable read-only for bootstrap operations.
+    # GR will manage read-only after START GROUP_REPLICATION.
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
     if [[ "$joining_for_first_time" == "1" ]]; then
-        retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 60 ${mysql} -N -e "RESET MASTER;"
     fi
-    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
-    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
+    retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
+    retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+    retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
 }
 
 function join_into_cluster() {
@@ -394,13 +438,17 @@ function join_into_cluster() {
     log "INFO" "The replica, ${report_host} is joining into the existing group..."
     local mysql="$mysql_header --host=$localhost"
 
+    # Temporarily disable read-only for join operations.
+    # GR will manage read-only after START GROUP_REPLICATION.
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
     export mysqld_alive=1
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
-        retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 60 ${mysql} -N -e "RESET MASTER;"
         # clone process will run when the joiner get valid donor and the primary member's data will be be gather than or equal  128MB
         if [[ $valid_donor_found == 1 ]] && [[ $primary_db_size -ge 128 ]]; then
             for donor in ${donors[*]}; do
@@ -418,7 +466,7 @@ function join_into_cluster() {
                 fi
 
                 # wait for background process `mysqld` have been killed
-                for i in {120..0}; do
+                for i in {60..0}; do
                     kill -0 $pid
                     exit="$?"
                     log "INFO" "Attempt $i: Checking mysqld(process id=$pid) is alive or not, exit code: $exit"
@@ -439,13 +487,13 @@ function join_into_cluster() {
     fi
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
@@ -458,12 +506,16 @@ function join_by_clone() {
     log "INFO" "The replica, ${report_host} is joining into the existing group..."
     local mysql="$mysql_header --host=$localhost"
 
+    # Temporarily disable read-only for clone operations.
+    # GR will manage read-only after START GROUP_REPLICATION.
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
     export mysqld_alive=1
     log "INFO" "Resetting binlog & gtid to initial state as $report_host is joining for first time.."
-    retry 120 ${mysql} -N -e "RESET MASTER;"
+    retry 60 ${mysql} -N -e "RESET MASTER;"
     if [[ $valid_donor_found == 1 ]]; then
         for donor in ${donors[*]}; do
             log "INFO" "Cloning data from $donor to $report_host....."
@@ -480,7 +532,7 @@ function join_by_clone() {
             fi
 
             # wait for background process `mysqld` have been killed
-            for i in {120..0}; do
+            for i in {60..0}; do
                 kill -0 $pid
                 exit="$?"
                 log "INFO" "Attempt $i: Checking mysqld(process id=$pid) is alive or not, exit code: $exit"
@@ -500,13 +552,13 @@ function join_by_clone() {
     fi
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
