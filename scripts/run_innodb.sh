@@ -89,22 +89,25 @@ function create_replication_user() {
     # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';"
     out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-    # if the user doesn't exist, crete new one.
+    # if the user doesn't exist, create new one.
+    # All operations run in a SINGLE session with SQL_LOG_BIN=0 to prevent
+    # writing local GTIDs that would create errant transactions on rejoin.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user..."
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
-        retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' REQUIRE SSL;"
-        retry 120 ${mysql} -N -e "GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT DELETE, INSERT, UPDATE ON mysql.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_bkp.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_previous.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT CLONE_ADMIN, BACKUP_ADMIN, CONNECTION_ADMIN, EXECUTE, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN, REPLICATION_APPLIER, REPLICATION_SLAVE_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN ON *.* TO 'repl'@'%' WITH GRANT OPTION;"
-        #mysql-server docker image doesn't has the user root that can connect from any host
-        retry 120 ${mysql} -N -e "CREATE USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';"
-        retry 120 ${mysql} -N -e "GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
+        retry 120 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' REQUIRE SSL;
+            GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT DELETE, INSERT, UPDATE ON mysql.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_bkp.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_previous.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT CLONE_ADMIN, BACKUP_ADMIN, CONNECTION_ADMIN, EXECUTE, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN, REPLICATION_APPLIER, REPLICATION_SLAVE_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN ON *.* TO 'repl'@'%' WITH GRANT OPTION;
+            CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+            SET SQL_LOG_BIN=1;
+        "
     fi
     #    retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
     touch /scripts/ready.txt
@@ -115,7 +118,9 @@ already_configured=0
 
 function configure_instance() {
     log "INFO" "configuring instance $report_host."
-    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD}"
+    # Use root user for local mysqlsh operations (repl user has REQUIRE SSL
+    # which blocks socket/localhost connections on MySQL 8.4+)
+    local mysqlshell="mysqlsh -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD}"
 
     retry 120 ${mysqlshell} --sql -e "select @@gtid_mode;"
     gtid=($($mysqlshell --sql -e "select @@gtid_mode;"))
@@ -198,8 +203,8 @@ check_instance_joined_in_cluster() {
 
     for host in "${out[@]}"; do
         if [[ "$host" == "$report_host" ]]; then
-            join_in_cluster=1
-            echo "$report_host successfully join_in_cluster"
+            joined_in_cluster=1
+            echo "$report_host successfully joined_in_cluster"
         fi
     done
 }
@@ -244,7 +249,7 @@ function reboot_from_completeOutage() {
 
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
-    /entrypoint.sh mysqld --user=root --report-host=$report_host --bind-address=* $args &
+    docker-entrypoint.sh mysqld --user=root --report-host=$report_host --bind-address=* $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
