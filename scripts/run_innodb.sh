@@ -36,20 +36,14 @@ IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
 
-whitelist="$MYSQL_GROUP_REPLICATION_IP_WHITELIST"
-if [ -z "$whitelist" ]; then
-    if [[ "$POD_IP_TYPE" == "IPv6" ]]; then
-        whitelist="$POD_IP"/64
-    else
-        whitelist="$POD_IP"/16
-    fi
-fi
 mkdir -p /etc/mysql/conf.d/
 cat >>/etc/mysql/my.cnf <<EOL
 !includedir /etc/mysql/conf.d/
 [mysqld]
 mysql_native_password=ON
-loose-group_replication_ip_allowlist = "${whitelist}"
+# Use MySQL communication stack instead of XCom (8.0.27+).
+# Benefits: no extra port 33061, no IP allowlist needed, uses MySQL auth + SSL.
+loose-group_replication_communication_stack = MYSQL
 EOL
 
 function retry {
@@ -143,12 +137,12 @@ function configure_instance() {
 
     # In MySQL Shell 8.4:
     #   - Pass credentials via URI (not via 'password' option — removed)
-    #   - Don't pass clusterAdmin/clusterAdminPassword if account already exists
-    #   - Use restart:false — we handle restart ourselves (container environment)
-    retry 30 ${mysqlsh_local} -e "dba.configureInstance('${MYSQL_ROOT_USERNAME}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{restart:false});"
+    #   - mycnfPath required so Shell writes config instead of prompting
+    #   - restart:false — we handle restart ourselves (container environment)
+    #   - Pipe 'yes' to auto-confirm any remaining prompts
+    yes | ${mysqlsh_local} -e "dba.configureInstance('${MYSQL_ROOT_USERNAME}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{mycnfPath:'/etc/mysql/my.cnf',restart:false});"
 
-    # Manually restart mysqld after configuration (restart:true doesn't work
-    # reliably in containers — mysqlsh can't restart a process it didn't start)
+    # Manually restart mysqld after configuration
     log "INFO" "Shutting down mysqld for restart after configure..."
     mysqladmin -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} --port=3306 shutdown
     wait $pid
@@ -158,8 +152,10 @@ function configure_instance() {
 function create_cluster() {
     local mysqlsh_remote="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD} -h${report_host}"
     clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
-    # consistency defaults to BEFORE_ON_PRIMARY_FAILOVER on 8.4+
-    retry 5 $mysqlsh_remote -e "cluster=dba.createCluster('$clusterName',{manualStartOnBoot:true});"
+    # communicationStack:'MYSQL' — uses MySQL protocol on port 3306 instead of XCom on 33061.
+    # No IP allowlist needed, uses MySQL auth + SSL. Requires 8.0.27+.
+    # consistency defaults to BEFORE_ON_PRIMARY_FAILOVER on 8.4+.
+    retry 5 $mysqlsh_remote -e "cluster=dba.createCluster('$clusterName',{communicationStack:'MYSQL',manualStartOnBoot:true});"
 }
 
 export primary=""
