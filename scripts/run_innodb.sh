@@ -48,6 +48,16 @@ loose-group_replication_communication_stack = MYSQL
 loose_group_replication_unreachable_majority_timeout = 20
 EOL
 
+# Multi-Primary mode: allow all nodes to accept writes (match run.sh)
+if [[ "$PRIMARY_TYPE" == "Multi-Primary" ]]; then
+    log "INFO" "Configuring Multi-Primary mode"
+    cat >>/etc/mysql/my.cnf <<EOL
+[mysqld]
+loose-group_replication_single_primary_mode = OFF
+loose-group_replication_enforce_update_everywhere_checks = ON
+EOL
+fi
+
 function retry {
 
     local retries="$1"
@@ -183,7 +193,12 @@ function create_cluster() {
     ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     # communicationStack:'MYSQL' — uses MySQL protocol on port 3306 instead of XCom on 33061.
     # consistency defaults to BEFORE_ON_PRIMARY_FAILOVER on 8.4+.
-    retry 5 $mysqlsh_remote -e "cluster=dba.createCluster('$clusterName',{communicationStack:'MYSQL',manualStartOnBoot:true});"
+    if [[ "$PRIMARY_TYPE" == "Multi-Primary" ]]; then
+        log "INFO" "Creating InnoDB Cluster in Multi-Primary mode"
+        retry 5 $mysqlsh_remote -e "cluster=dba.createCluster('$clusterName',{communicationStack:'MYSQL',manualStartOnBoot:true,multiPrimary:true,force:true});"
+    else
+        retry 5 $mysqlsh_remote -e "cluster=dba.createCluster('$clusterName',{communicationStack:'MYSQL',manualStartOnBoot:true});"
+    fi
 }
 
 export primary=""
