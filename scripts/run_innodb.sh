@@ -37,10 +37,16 @@ IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
 
+# Unique server_id per pod (same logic as run.sh for Group Replication).
+# Required by dba.createCluster() — MySQL 9.6+ no longer auto-assigns unique IDs.
+svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1))
+log "INFO" "server_id = $svr_id"
+
 mkdir -p /etc/mysql/conf.d/
 cat >>/etc/mysql/my.cnf <<EOL
 !includedir /etc/mysql/conf.d/
 [mysqld]
+server_id = ${svr_id}
 # Use MySQL communication stack instead of XCom (8.0.27+).
 # Benefits: no extra port 33061, no IP allowlist needed, uses MySQL auth + SSL.
 loose-group_replication_communication_stack = MYSQL
@@ -152,14 +158,18 @@ already_configured=0
 function configure_instance() {
     log "INFO" "configuring instance $report_host."
 
-    # Check if already configured (gtid_mode=ON means it was configured before)
-    retry 60 ${mysqlsh_local} --sql -e "select @@gtid_mode;"
-    gtid=($(${mysqlsh_local} --sql -e "select @@gtid_mode;"))
-    if [[ "${gtid[1]}" == "ON" ]]; then
+    # Use dba.checkInstanceConfiguration() to determine if configuration is needed.
+    # NOTE: Cannot use gtid_mode=ON check because MySQL 9.6+ ships with gtid_mode=ON
+    # by default, which would incorrectly skip configureInstance() on first boot.
+    retry 60 ${mysqlsh_local} --sql -e "select 1;"
+    check_result=$(${mysqlsh_local} -e "dba.checkInstanceConfiguration('${MYSQL_ROOT_USERNAME}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306');" 2>&1)
+    if echo "$check_result" | grep -q "status.*ok"; then
         log "INFO" "$report_host is already_configured."
         already_configured=1
         return
     fi
+
+    log "INFO" "Instance needs configuration. Running dba.configureInstance()..."
 
     # In MySQL Shell 8.4+/9.x:
     #   - Pass credentials via URI (not via 'password' option — removed)
