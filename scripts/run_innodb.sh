@@ -22,7 +22,7 @@ function log() {
 }
 
 args=$@
-report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
+report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE"
 log "INFO" "report_host = $report_host"
 
 # wait for the peer-list file created by coordinator
@@ -44,9 +44,12 @@ mysql_native_password=ON
 # Use MySQL communication stack instead of XCom (8.0.27+).
 # Benefits: no extra port 33061, no IP allowlist needed, uses MySQL auth + SSL.
 loose-group_replication_communication_stack = MYSQL
+# Faster failover on network partition (match run.sh)
+loose_group_replication_unreachable_majority_timeout = 20
 EOL
 
 function retry {
+
     local retries="$1"
     shift
     local count=0
@@ -61,6 +64,11 @@ function retry {
             return $exit
         fi
         count=$(($count + 1))
+        # Allow coordinator to stop retries (match run.sh)
+        retryfile="/scripts/retry-stop"
+        if [ -e "$retryfile" ]; then
+            return 0
+        fi
     done
     return 0
 }
@@ -75,6 +83,14 @@ function wait_for_host_online() {
     else
         log "INFO" "server failed to comes online within 900 seconds"
     fi
+
+    # Set read-only immediately after MySQL starts to prevent any external
+    # process (e.g. KubeDB health checker) from writing local GTIDs before
+    # the node joins the cluster. Cannot be set in my.cnf because it blocks --initialize.
+    # (match run.sh)
+    local mysql_ro="mysql -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} --port=3306"
+    ${mysql_ro} -N -e "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" 2>/dev/null
+    log "INFO" "Set super_read_only=ON to prevent errant GTIDs"
 }
 
 # mysql client shorthand — always use root for local operations
@@ -86,15 +102,18 @@ replication_user=repl
 function create_replication_user() {
     log "INFO" "Checking whether replication user exist or not..."
 
-    retry 120 ${mysql_local} -N -e "select count(host) from mysql.user where mysql.user.user='${replication_user}';"
+    retry 60 ${mysql_local} -N -e "select count(host) from mysql.user where mysql.user.user='${replication_user}';"
     out=$(${mysql_local} -N -e "select count(host) from mysql.user where mysql.user.user='${replication_user}';" | awk '{print$1}')
 
     # All operations in a SINGLE session with SQL_LOG_BIN=0 to prevent errant GTIDs.
     # Uses IF NOT EXISTS because appscode images already create root@% via entrypoint.
+    # (match run.sh single-session pattern)
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user..."
-        retry 120 ${mysql_local} -N -e "
+        retry 60 ${mysql_local} -N -e "
             SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
             CREATE USER IF NOT EXISTS '${replication_user}'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' REQUIRE SSL;
             GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO '${replication_user}'@'%' WITH GRANT OPTION;
             GRANT DELETE, INSERT, UPDATE ON mysql.* TO '${replication_user}'@'%' WITH GRANT OPTION;
@@ -105,15 +124,22 @@ function create_replication_user() {
             CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
             GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;
             FLUSH PRIVILEGES;
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
             SET SQL_LOG_BIN=1;
         "
     else
         log "INFO" "Replication user exists. Updating password if changed..."
-        retry 120 ${mysql_local} -N -e "
+        # Update password in case it was rotated via RotateAuth (match run.sh)
+        retry 60 ${mysql_local} -N -e "
             SET SQL_LOG_BIN=0;
+            SET GLOBAL super_read_only=OFF;
+            SET GLOBAL read_only=OFF;
             ALTER USER '${replication_user}'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
             ALTER USER IF EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
             FLUSH PRIVILEGES;
+            SET GLOBAL read_only=ON;
+            SET GLOBAL super_read_only=ON;
             SET SQL_LOG_BIN=1;
         "
     fi
@@ -127,7 +153,7 @@ function configure_instance() {
     log "INFO" "configuring instance $report_host."
 
     # Check if already configured (gtid_mode=ON means it was configured before)
-    retry 120 ${mysqlsh_local} --sql -e "select @@gtid_mode;"
+    retry 60 ${mysqlsh_local} --sql -e "select @@gtid_mode;"
     gtid=($(${mysqlsh_local} --sql -e "select @@gtid_mode;"))
     if [[ "${gtid[1]}" == "ON" ]]; then
         log "INFO" "$report_host is already_configured."
@@ -142,7 +168,8 @@ function configure_instance() {
     #   - Pipe 'yes' to auto-confirm any remaining prompts
     yes | ${mysqlsh_local} -e "dba.configureInstance('${MYSQL_ROOT_USERNAME}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{mycnfPath:'/etc/mysql/my.cnf',restart:false});"
 
-    # Manually restart mysqld after configuration
+    # Manually restart mysqld after configuration (match run.sh pattern:
+    # restart:false + manual shutdown, because mysqlsh can't restart a process it didn't start)
     log "INFO" "Shutting down mysqld for restart after configure..."
     mysqladmin -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} --port=3306 shutdown
     wait $pid
@@ -152,8 +179,9 @@ function configure_instance() {
 function create_cluster() {
     local mysqlsh_remote="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD} -h${report_host}"
     clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
+    # Temporarily disable read-only for cluster bootstrap (match run.sh)
+    ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     # communicationStack:'MYSQL' — uses MySQL protocol on port 3306 instead of XCom on 33061.
-    # No IP allowlist needed, uses MySQL auth + SSL. Requires 8.0.27+.
     # consistency defaults to BEFORE_ON_PRIMARY_FAILOVER on 8.4+.
     retry 5 $mysqlsh_remote -e "cluster=dba.createCluster('$clusterName',{communicationStack:'MYSQL',manualStartOnBoot:true});"
 }
@@ -194,12 +222,16 @@ function is_already_in_cluster() {
 function join_in_cluster() {
     log "INFO" "$report_host joining in cluster"
     local mysqlsh_primary="mysqlsh --js -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    # Temporarily disable read-only for join operations (match run.sh)
+    ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{recoveryMethod:'incremental'});"
 }
 
 function join_by_clone() {
     log "INFO" "$report_host joining in cluster by clone"
     local mysqlsh_primary="mysqlsh --js -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    # Temporarily disable read-only for clone operations (match run.sh)
+    ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.removeInstance('${report_host}:3306',{force:true});"
     retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{recoveryMethod:'clone'});"
     # Clone restarts mysqld — wait for the old process to finish
@@ -226,6 +258,8 @@ function make_sure_instance_join_in_cluster() {
 
 function rejoin_in_cluster() {
     local mysqlsh_primary="mysqlsh --js -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    # Temporarily disable read-only for rejoin (match run.sh)
+    ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.rejoinInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306')"
     out=($(${mysqlsh_primary} --sql -e "SELECT member_host FROM performance_schema.replication_group_members;"))
 
@@ -249,6 +283,8 @@ export pid
 function reboot_from_completeOutage() {
     local mysqlsh_self="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
     clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
+    # Temporarily disable read-only for reboot (match run.sh)
+    ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     yes | $mysqlsh_self -e "dba.rebootClusterFromCompleteOutage('$clusterName',{force:true})"
     yes | $mysqlsh_self -e "cluster = dba.getCluster(); cluster.rescan()"
     wait $pid
@@ -256,6 +292,8 @@ function reboot_from_completeOutage() {
 
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
+    # Use docker-entrypoint.sh (in PATH at /usr/local/bin/) — works on both
+    # Oracle mysql-server images and appscode images.
     docker-entrypoint.sh mysqld --user=root --report-host=$report_host --bind-address=* $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
