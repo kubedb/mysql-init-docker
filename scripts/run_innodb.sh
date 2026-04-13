@@ -219,6 +219,60 @@ function create_cluster() {
     fi
 }
 
+function fix_metadata_uuids() {
+    # After a pod restart with data loss (PVC deleted), MySQL generates a new server_uuid.
+    # The InnoDB Cluster metadata still has the old UUID, causing dba.getCluster() to fail
+    # with "unmanaged replication group" or "Metadata for instance not found".
+    #
+    # Strategy: Find any ONLINE member whose UUID matches metadata (so dba.getCluster() works),
+    # then use cluster.removeInstance(stale) + cluster.addInstance(fresh) for mismatched nodes.
+    # This is the safe path — the rejoining node gets a full data copy via incremental/clone recovery.
+    log "INFO" "Checking for stale server_uuid in InnoDB Cluster metadata..."
+
+    # Find a peer whose UUID matches metadata (can serve as the entry point for dba.getCluster())
+    local good_host=""
+    for host in "${peers[@]}"; do
+        actual_uuid=$(mysql -u${MYSQL_ROOT_USERNAME} -h${host} -p${MYSQL_ROOT_PASSWORD} --port=3306 -N -e "SELECT @@server_uuid;" 2>/dev/null)
+        if [[ -z "$actual_uuid" ]]; then
+            continue
+        fi
+        stored_uuid=$(mysql -u${MYSQL_ROOT_USERNAME} -h${host} -p${MYSQL_ROOT_PASSWORD} --port=3306 -N -e \
+            "SELECT mysql_server_uuid FROM mysql_innodb_cluster_metadata.instances WHERE address='${host}:3306';" 2>/dev/null)
+        if [[ -n "$stored_uuid" && "$stored_uuid" == "$actual_uuid" ]]; then
+            good_host="$host"
+            break
+        fi
+    done
+
+    if [[ -z "$good_host" ]]; then
+        log "WARNING" "No peer with matching UUID found in metadata. Cannot fix metadata — may need full cluster reboot."
+        return
+    fi
+
+    # For each peer with mismatched UUID, remove the stale entry and re-add via clone
+    for host in "${peers[@]}"; do
+        actual_uuid=$(mysql -u${MYSQL_ROOT_USERNAME} -h${host} -p${MYSQL_ROOT_PASSWORD} --port=3306 -N -e "SELECT @@server_uuid;" 2>/dev/null)
+        if [[ -z "$actual_uuid" ]]; then
+            continue
+        fi
+        stored_uuid=$(mysql -u${MYSQL_ROOT_USERNAME} -h${host} -p${MYSQL_ROOT_PASSWORD} --port=3306 -N -e \
+            "SELECT mysql_server_uuid FROM mysql_innodb_cluster_metadata.instances WHERE address='${host}:3306';" 2>/dev/null)
+
+        if [[ -n "$stored_uuid" && "$stored_uuid" != "$actual_uuid" ]]; then
+            log "INFO" "UUID mismatch for $host: metadata=$stored_uuid actual=$actual_uuid"
+            log "INFO" "Removing stale instance from cluster and re-adding with fresh data..."
+            local mysqlsh_good="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD} -h${good_host}"
+            # Remove the stale metadata entry
+            ${mysqlsh_good} -e "cluster = dba.getCluster(); cluster.removeInstance('${host}:3306',{force:true});" 2>/dev/null
+            # Re-add the instance — it will get a full data copy via recovery
+            if [[ "$host" != "$report_host" ]]; then
+                # Only re-add remote peers here; the current host will be added by join_in_cluster
+                ${mysqlsh_good} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${host}:3306',{recoveryMethod:'clone'});" 2>/dev/null
+            fi
+        fi
+    done
+}
+
 export primary=""
 function select_primary() {
     for i in {900..0}; do
@@ -240,6 +294,8 @@ already_in_cluster=0
 
 function is_already_in_cluster() {
     local mysqlsh_primary="mysqlsh --js -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    # Fix stale UUIDs in metadata before calling dba.getCluster()
+    fix_metadata_uuids
     # Use rescan() without options — addInstances and interactive were removed in MySQL Shell 9.6+
     ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.rescan()"
     out=($(${mysqlsh_primary} --sql -e "SELECT member_host FROM performance_schema.replication_group_members where member_state='ONLINE';"))
@@ -293,6 +349,8 @@ function make_sure_instance_join_in_cluster() {
 
 function rejoin_in_cluster() {
     local mysqlsh_primary="mysqlsh --js -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    # Fix stale UUIDs in metadata before calling dba.getCluster()
+    fix_metadata_uuids
     # Temporarily disable read-only for rejoin (match run.sh)
     ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.rejoinInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306')"
@@ -318,6 +376,8 @@ export pid
 function reboot_from_completeOutage() {
     local mysqlsh_self="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
     clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
+    # Fix stale UUIDs in metadata before calling dba.rebootClusterFromCompleteOutage()
+    fix_metadata_uuids
     # Temporarily disable read-only for reboot (match run.sh)
     ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     yes | $mysqlsh_self -e "dba.rebootClusterFromCompleteOutage('$clusterName',{force:true})"
