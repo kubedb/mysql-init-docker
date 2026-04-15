@@ -46,6 +46,7 @@ mysql_native_password=ON
 loose-group_replication_communication_stack = MYSQL
 # Faster failover on network partition (match run.sh)
 loose_group_replication_unreachable_majority_timeout = 20
+loose_group_replication_exit_state_action = OFFLINE_MODE
 EOL
 
 # Multi-Primary mode: allow all nodes to accept writes (match run.sh)
@@ -298,6 +299,20 @@ export pid
 function reboot_from_completeOutage() {
     local mysqlsh_self="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
     clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
+
+    # Before rebooting, stop GR on any peer stuck in ERROR state.
+    # dba.rebootClusterFromCompleteOutage() refuses to proceed if any peer has GR
+    # in ERROR state ("belongs to a GR group that is not managed as an InnoDB Cluster").
+    # All peers must be in OFFLINE state for the reboot to work.
+    for host in "${peers[@]}"; do
+        peer_state=$(mysql -u${MYSQL_ROOT_USERNAME} -h${host} -p${MYSQL_ROOT_PASSWORD} --port=3306 -N -e \
+            "SELECT MEMBER_STATE FROM performance_schema.replication_group_members LIMIT 1;" 2>/dev/null)
+        if [[ "$peer_state" == "ERROR" ]]; then
+            log "INFO" "Stopping GR on $host (stuck in ERROR state) before cluster reboot..."
+            mysql -u${MYSQL_ROOT_USERNAME} -h${host} -p${MYSQL_ROOT_PASSWORD} --port=3306 -N -e "STOP GROUP_REPLICATION;" 2>/dev/null
+        fi
+    done
+
     # Temporarily disable read-only for reboot (match run.sh)
     ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     yes | $mysqlsh_self -e "dba.rebootClusterFromCompleteOutage('$clusterName',{force:true})"
