@@ -171,6 +171,7 @@ cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 # for multi-primary mode, where any host can accept writes
 loose-group_replication_single_primary_mode = OFF
 loose-group_replication_enforce_update_everywhere_checks = ON
+loose_group_replication_exit_state_action = OFFLINE_MODE
 EOL
 fi
 

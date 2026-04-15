@@ -46,6 +46,7 @@ cat >>/etc/mysql/my.cnf <<EOL
 loose-group_replication_communication_stack = MYSQL
 # Faster failover on network partition (match run.sh)
 loose_group_replication_unreachable_majority_timeout = 20
+loose_group_replication_exit_state_action = OFFLINE_MODE
 EOL
 
 # Multi-Primary mode: allow all nodes to accept writes (match run.sh)
