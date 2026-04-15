@@ -12,6 +12,23 @@
 #   5. REQUIRE SSL is strictly enforced on socket connections (repl can't connect locally)
 #   6. mysql_native_password plugin removed entirely in MySQL 9.x
 
+env | sort | grep "POD\|HOST\|NAME"
+RECOVERY_DONE_FILE="/tmp/recovery.done"
+if [[ "$PITR_RESTORE" == "true" ]]; then
+    while true; do
+      sleep 2
+      echo "Point In Time Recovery In Progress. Waiting for $RECOVERY_DONE_FILE file"
+      if [[ -e "$RECOVERY_DONE_FILE" ]]; then
+        echo "$RECOVERY_DONE_FILE found."
+        break
+      fi
+    done
+fi
+
+if [[ -e "$RECOVERY_DONE_FILE" ]]; then
+  rm $RECOVERY_DONE_FILE
+fi
+
 function timestamp() {
     date +"%Y/%m/%d %T"
 }
