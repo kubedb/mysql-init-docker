@@ -382,43 +382,57 @@ while true; do
     fi
 
     # wait for the signal file from coordinator
+    # Also check if this node is already ONLINE in GR — this happens when
+    # another pod's coordinator called rebootClusterFromCompleteOutage() which
+    # rejoins all members remotely via mysqlsh AdminAPI, bypassing this script.
     while [ ! -f "/scripts/signal.txt" ]; do
+        member_state=$(mysql -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} -N -e \
+            "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
+        if [[ "$member_state" == "ONLINE" ]]; then
+            log "INFO" "Already ONLINE in GR group (joined by another node's reboot) — skipping signal wait"
+            break
+        fi
         log "WARNING" "signal is not present yet!"
         sleep 1
     done
 
-    desired_func=$(cat /scripts/signal.txt)
-    rm -rf /scripts/signal.txt
-    log "INFO" "going to execute $desired_func"
+    # If we broke out because GR is already ONLINE (no signal file), skip to wait.
+    if [ ! -f "/scripts/signal.txt" ]; then
+        log "INFO" "No signal to execute — node already joined via external reboot"
+    else
+        desired_func=$(cat /scripts/signal.txt)
+        rm -rf /scripts/signal.txt
+        log "INFO" "going to execute $desired_func"
 
-    if [[ $desired_func == "create_cluster" ]]; then
-        create_cluster
-    fi
-
-    if [[ $desired_func == "join_in_cluster" ]]; then
-        select_primary
-        join_in_cluster
-        check_instance_joined_in_cluster
-        if [[ "$joined_in_cluster" == "0" ]]; then
-            make_sure_instance_join_in_cluster
+        if [[ $desired_func == "create_cluster" ]]; then
+            create_cluster
         fi
-    fi
 
-    if [[ $desired_func == "rejoin_in_cluster" ]]; then
-        select_primary
-        rejoin_in_cluster
-    fi
+        if [[ $desired_func == "join_in_cluster" ]]; then
+            select_primary
+            join_in_cluster
+            check_instance_joined_in_cluster
+            if [[ "$joined_in_cluster" == "0" ]]; then
+                make_sure_instance_join_in_cluster
+            fi
+        fi
 
-    if [[ $desired_func == "join_by_clone" ]]; then
-        select_primary
-        join_by_clone
-        start_mysqld_in_background
-        wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
-        join_in_cluster
-    fi
+        if [[ $desired_func == "rejoin_in_cluster" ]]; then
+            select_primary
+            rejoin_in_cluster
+        fi
 
-    if [[ $desired_func == "reboot_from_complete_outage" ]]; then
-        reboot_from_completeOutage
+        if [[ $desired_func == "join_by_clone" ]]; then
+            select_primary
+            join_by_clone
+            start_mysqld_in_background
+            wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
+            join_in_cluster
+        fi
+
+        if [[ $desired_func == "reboot_from_complete_outage" ]]; then
+            reboot_from_completeOutage
+        fi
     fi
 
     log "INFO" "waiting for mysql process id = $pid"
