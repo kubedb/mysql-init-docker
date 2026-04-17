@@ -13,7 +13,7 @@ function log() {
 
 #stores all the arguments that are passed from statefulSet
 args=$@
-report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE.svc"
+report_host="$HOSTNAME.$GOV_SVC.$POD_NAMESPACE"
 log "INFO" "report_host = $report_host"
 # wait for the peer-list file created by coordinator
 while [ ! -f "/scripts/peer-list" ]; do
@@ -102,19 +102,29 @@ function create_replication_user() {
     # if the user doesn't exist, crete new one.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found. Creating new replication user..."
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
-        retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' REQUIRE SSL;"
-        retry 120 ${mysql} -N -e "GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT DELETE, INSERT, UPDATE ON mysql.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_bkp.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_previous.* TO 'repl'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "GRANT CLONE_ADMIN, BACKUP_ADMIN, CONNECTION_ADMIN, EXECUTE, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN, REPLICATION_APPLIER, REPLICATION_SLAVE_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN ON *.* TO 'repl'@'%' WITH GRANT OPTION;"
-        #mysql-server docker image doesn't has the user root that can connect from any host
-        retry 10 ${mysql} -N -e "CREATE USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';"
-        retry 120 ${mysql} -N -e "GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;"
-        retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
-        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
+        retry 120 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' REQUIRE SSL;
+            GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT DELETE, INSERT, UPDATE ON mysql.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_bkp.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_previous.* TO 'repl'@'%' WITH GRANT OPTION;
+            GRANT CLONE_ADMIN, BACKUP_ADMIN, CONNECTION_ADMIN, EXECUTE, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN, REPLICATION_APPLIER, REPLICATION_SLAVE_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN ON *.* TO 'repl'@'%' WITH GRANT OPTION;
+            CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+            SET SQL_LOG_BIN=1;
+        "
+    else
+        log "INFO" "Replication user exists. Updating password if changed..."
+        retry 120 ${mysql} -N -e "
+            SET SQL_LOG_BIN=0;
+            ALTER USER 'repl'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            ALTER USER IF EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            FLUSH PRIVILEGES;
+            SET SQL_LOG_BIN=1;
+        "
     fi
     #    retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='$MYSQL_ROOT_PASSWORD' FOR CHANNEL 'group_replication_recovery';"
     touch /scripts/ready.txt
@@ -125,7 +135,7 @@ already_configured=0
 
 function configure_instance() {
     log "INFO" "configuring instance $report_host."
-    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD}"
+    local mysqlshell="mysqlsh -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD}"
 
     retry 120 ${mysqlshell} --sql -e "select @@gtid_mode;"
     gtid=($($mysqlshell --sql -e "select @@gtid_mode;"))
@@ -135,22 +145,17 @@ function configure_instance() {
         return
     fi
 
-    retry 30 ${mysqlshell} -e "dba.configureInstance('${replication_user}@${report_host}',{password:'${MYSQL_ROOT_PASSWORD}',interactive:false,restart:false});"
-    #instance need to restart after configuration
-    # Prevent creation of new process until this one is finished
-    #https://serverfault.com/questions/477448/mysql-keeps-crashing-innodb-unable-to-lock-ibdata1-error-11
-    #The most common cause of this problem is trying to start MySQL when it is already running.
+    yes | ${mysqlshell} -e "dba.configureInstance('${MYSQL_ROOT_USERNAME}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{mycnfPath:'/etc/mysql/my.cnf',restart:false});"
 
-    #for non-root users, set the restart flag to false, stop the mysqld process, set restart_required=1 to start the process
     mysqladmin -u ${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} --port=3306 shutdown
     wait $pid
     restart_required=1
 }
 
 function create_cluster() {
-    local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${report_host}"
+    local mysqlshell="mysqlsh -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD} -h${report_host}"
     clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
-    retry 5 $mysqlshell -e "cluster=dba.createCluster('$clusterName',{consistency:'BEFORE_ON_PRIMARY_FAILOVER',manualStartOnBoot:'true'});"
+    retry 5 $mysqlshell -e "cluster=dba.createCluster('$clusterName',{communicationStack:'MYSQL',manualStartOnBoot:true});"
 }
 
 export primary=""
@@ -246,7 +251,7 @@ function rejoin_in_cluster() {
 
 export pid
 function reboot_from_completeOutage() {
-    local mysqlshell="mysqlsh -u${replication_user} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
+    local mysqlshell="mysqlsh -u${MYSQL_ROOT_USERNAME} -h${report_host} -p${MYSQL_ROOT_PASSWORD}"
     #https://dev.mysql.com/doc/dev/mysqlsh-api-javascript/8.0/classmysqlsh_1_1dba_1_1_dba.html#ac68556e9a8e909423baa47dc3b42aadb
     #mysql wait for user interaction to remove the unavailable seed from the cluster..
     clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
@@ -257,7 +262,7 @@ function reboot_from_completeOutage() {
 
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
-    /entrypoint.sh mysqld --user=root --report-host=$report_host --bind-address=* $args &
+    docker-entrypoint.sh mysqld --user=root --report-host=$report_host --bind-address=* $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
@@ -271,7 +276,7 @@ configure_instance
 
 if [[ "$restart_required" == "1" ]]; then
     start_mysqld_in_background
-    wait_for_host_online "repl" "$report_host" "$MYSQL_ROOT_PASSWORD"
+    wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
 fi
 
 mysqld_alive=0
@@ -292,7 +297,7 @@ while true; do
     else
         echo "need start mysqld and wait_for_mysqld_running"
         start_mysqld_in_background
-        wait_for_host_online "repl" "$report_host" "$MYSQL_ROOT_PASSWORD"
+        wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
     fi
 
     # wait for the script copied by coordinator
@@ -326,7 +331,7 @@ while true; do
         select_primary
         join_by_clone
         start_mysqld_in_background
-        wait_for_host_online "repl" "$report_host" "$MYSQL_ROOT_PASSWORD"
+        wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
         join_in_cluster
     fi
 
