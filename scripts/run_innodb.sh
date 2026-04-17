@@ -53,9 +53,18 @@ IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
 
-mkdir -p /etc/mysql/conf.d/
+# Create a writable dir for mysqlsh's configureInstance() output.
+# Copy user's custom config (read-only Secret mount in conf.d/) into this writable dir.
+# Only include the writable dir in my.cnf — mysqlsh will write its config here too.
+INNODB_CONF_DIR="/etc/mysql/innodb-conf.d"
+mkdir -p "$INNODB_CONF_DIR"
+# Copy custom config files from read-only conf.d/ to writable dir
+if [ -d /etc/mysql/conf.d ] && ls /etc/mysql/conf.d/*.cnf >/dev/null 2>&1; then
+    cp /etc/mysql/conf.d/*.cnf "$INNODB_CONF_DIR/" 2>/dev/null
+    log "INFO" "Copied custom config from conf.d/ to writable $INNODB_CONF_DIR/"
+fi
 cat >>/etc/mysql/my.cnf <<EOL
-!includedir /etc/mysql/conf.d/
+!includedir ${INNODB_CONF_DIR}
 [mysqld]
 mysql_native_password=ON
 # Use MySQL communication stack instead of XCom (8.0.27+).
@@ -240,7 +249,7 @@ already_in_cluster=0
 
 function is_already_in_cluster() {
     local mysqlsh_primary="mysqlsh --js -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
-    ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.rescan({addInstances:['${report_host}:3306'],interactive:false})"
+    ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.rescan()"
     out=($(${mysqlsh_primary} --sql -e "SELECT member_host FROM performance_schema.replication_group_members where member_state='ONLINE';"))
 
     for host in ${out[@]}; do
@@ -286,7 +295,7 @@ function check_instance_joined_in_cluster() {
 
 function make_sure_instance_join_in_cluster() {
     local mysqlsh_primary="mysqlsh --js -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
-    retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.rescan({addInstances:['${report_host}:3306'],interactive:false})"
+    retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.rescan()"
 }
 
 function rejoin_in_cluster() {
