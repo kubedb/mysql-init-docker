@@ -136,6 +136,7 @@ log_bin = binlog
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
 loose_group_replication_unreachable_majority_timeout = 20
+loose_group_replication_exit_state_action = OFFLINE_MODE
 
 # default tls configuration for the group
 # group_replication_recovery_use_ssl will be overwritten from DB arguments
@@ -171,7 +172,6 @@ cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 # for multi-primary mode, where any host can accept writes
 loose-group_replication_single_primary_mode = OFF
 loose-group_replication_enforce_update_everywhere_checks = ON
-loose_group_replication_exit_state_action = OFFLINE_MODE
 EOL
 fi
 

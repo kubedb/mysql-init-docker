@@ -54,9 +54,18 @@ IFS=', ' read -r -a peers <<<"$hosts"
 echo "${peers[@]}"
 log "INFO" "hosts are ${peers[@]}"
 
-mkdir -p /etc/mysql/conf.d/
+# Create a writable dir for mysqlsh's configureInstance() output.
+# Copy user's custom config (read-only Secret mount in conf.d/) into this writable dir.
+# Only include the writable dir in my.cnf — mysqlsh will write its config here too.
+INNODB_CONF_DIR="/etc/mysql/innodb-conf.d"
+mkdir -p "$INNODB_CONF_DIR"
+# Copy custom config files from read-only conf.d/ to writable dir
+if [ -d /etc/mysql/conf.d ] && ls /etc/mysql/conf.d/*.cnf >/dev/null 2>&1; then
+    cp /etc/mysql/conf.d/*.cnf "$INNODB_CONF_DIR/" 2>/dev/null
+    log "INFO" "Copied custom config from conf.d/ to writable $INNODB_CONF_DIR/"
+fi
 cat >>/etc/mysql/my.cnf <<EOL
-!includedir /etc/mysql/conf.d/
+!includedir ${INNODB_CONF_DIR}
 [mysqld]
 # Use MySQL communication stack instead of XCom (8.0.27+).
 # Benefits: no extra port 33061, no IP allowlist needed, uses MySQL auth + SSL.
