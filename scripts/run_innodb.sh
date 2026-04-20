@@ -121,6 +121,33 @@ function wait_for_host_online() {
 mysql_local="mysql -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} --port=3306"
 replication_user=repl
 
+# Kill any stale mysqlsh AdminAPI session holding the cluster-wide EXCLUSIVE lock
+# on $1 (usually the primary). A session holding AdminAPI_lock while in Sleep
+# state means a previous mysqlsh call died without releasing — rescan/addInstance/
+# rejoinInstance will hang with MYSQLSH 51500. Legitimate in-flight AdminAPI ops
+# are always in Query state, never Sleep. Kill Sleep>5s holders to auto-recover.
+function clear_stale_cluster_lock() {
+    local target_host=$1
+    local mysql_root="mysql -u${MYSQL_ROOT_USERNAME} -h${target_host} -p${MYSQL_ROOT_PASSWORD} --port=3306 -N"
+    local stuck_ids
+    stuck_ids=$(${mysql_root} -e "
+        SELECT t.PROCESSLIST_ID
+        FROM performance_schema.metadata_locks m
+        JOIN performance_schema.threads t ON m.OWNER_THREAD_ID = t.THREAD_ID
+        WHERE m.OBJECT_SCHEMA='AdminAPI_cluster'
+          AND m.OBJECT_NAME='AdminAPI_lock'
+          AND m.LOCK_TYPE='EXCLUSIVE'
+          AND t.PROCESSLIST_COMMAND='Sleep'
+          AND t.PROCESSLIST_TIME > 5;" 2>/dev/null | awk 'NF')
+    if [[ -n "$stuck_ids" ]]; then
+        for stuck_id in $stuck_ids; do
+            log "WARNING" "Killing stale AdminAPI_lock holder on ${target_host} (conn=${stuck_id}, Sleep>5s)"
+            ${mysql_root} -e "KILL ${stuck_id};" 2>/dev/null
+        done
+        sleep 2
+    fi
+}
+
 function create_replication_user() {
     log "INFO" "Checking whether replication user exist or not..."
     local mysql="mysql -u ${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} --port=3306"
@@ -214,6 +241,7 @@ already_in_cluster=0
 
 function is_already_in_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    clear_stale_cluster_lock "${primary}"
     ${mysqlshell} -e "cluster = dba.getCluster();  cluster.rescan()"
     out=($(${mysqlshell} --sql -e "SELECT member_host FROM performance_schema.replication_group_members where member_state='ONLINE';"))
 
@@ -229,13 +257,16 @@ function is_already_in_cluster() {
 function join_in_cluster() {
     log "INFO " "$report_host joining in cluster"
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    clear_stale_cluster_lock "${primary}"
     retry 10 ${mysqlshell} -e "cluster = dba.getCluster();cluster.addInstance('${replication_user}@${report_host}',{recoveryMethod:'incremental'});"
 }
 
 function join_by_clone() {
     log "INFO " "$report_host joining in cluster"
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    clear_stale_cluster_lock "${primary}"
     retry 10 ${mysqlshell} -e "cluster = dba.getCluster();cluster.removeInstance('$report_host',{force:'true'});"
+    clear_stale_cluster_lock "${primary}"
     retry 10 ${mysqlshell} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}@${report_host}',{recoveryMethod:'clone'});"
 
     #this is required for clone method
@@ -258,11 +289,13 @@ check_instance_joined_in_cluster() {
 
 function make_sure_instance_join_in_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    clear_stale_cluster_lock "${primary}"
     retry 10 ${mysqlshell} -e "cluster = dba.getCluster();  cluster.rescan()"
 }
 
 function rejoin_in_cluster() {
     local mysqlshell="mysqlsh -u${replication_user} -p${MYSQL_ROOT_PASSWORD} -h${primary}"
+    clear_stale_cluster_lock "${primary}"
     ${mysqlshell} -e "cluster=dba.getCluster(); cluster.rejoinInstance('${replication_user}@${report_host}')"
     out=($(${mysqlshell} --sql -e "SELECT member_host FROM performance_schema.replication_group_members;"))
 
@@ -277,6 +310,7 @@ function rejoin_in_cluster() {
     fi
     check_instance_joined_in_cluster
     if [[ "$joined_in_cluster" == "0" ]]; then
+        clear_stale_cluster_lock "${primary}"
         retry 1 ${mysqlshell} -e "cluster = dba.getCluster();cluster.removeInstance('$report_host',{force:'true'});"
         join_in_cluster
     fi
@@ -303,6 +337,7 @@ function reboot_from_completeOutage() {
     done
 
     yes | $mysqlshell -e "dba.rebootClusterFromCompleteOutage('$clusterName',{force:'true'})"
+    clear_stale_cluster_lock "${report_host}"
     yes | $mysqlshell -e "cluster = dba.getCluster();  cluster.rescan()"
     wait $pid
 }
