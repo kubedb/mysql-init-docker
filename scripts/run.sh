@@ -607,6 +607,7 @@ install_group_replication_plugin
 install_clone_plugin
 
 while true; do
+    echo "running">/scripts/setup.txt
     kill -0 $pid
     exit="$?"
     if [[ "$exit" == "0" ]]; then
