@@ -103,13 +103,32 @@ function wait_for_host_online() {
     log "INFO" "checking for host $2 to come online"
 
     local mysqlshell="mysql -u$1 -h$2 -p$3" # "mysql -uroot -ppass -hmysql-server-0.mysql-server.default.svc"
-    retry 900 ${mysqlshell} -e "select 1;" | awk '{print$1}'
-    out=$(${mysqlshell} -e "select 1;" | head -n1 | awk '{print$1}')
-    if [[ "$out" == "1" ]]; then
-        log "INFO" "host $2 is online"
-    else
-        log "INFO" "server failed to comes online within 900 seconds"
-    fi
+    local max_restarts=60
+    local restarts=0
+
+    while true; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            if (( restarts >= max_restarts )); then
+                log "ERROR" "mysqld (pid=$pid) died and exceeded $max_restarts restart attempts. Aborting."
+                exit 1
+            fi
+            restarts=$((restarts + 1))
+            log "ERROR" "mysqld (pid=$pid) is no longer running. Restart attempt $restarts/$max_restarts..."
+            start_mysqld_in_background
+            sleep 10
+            continue
+        fi
+        out=$(${mysqlshell} -e "select 1;" | head -n1 | awk '{print$1}')
+        log "INFO" "Attempt $i: Pinging '$report_host' has returned: '$out'...................................."
+        if [[ "$out" == "1" ]]; then
+            break
+        fi
+        log "INFO" "Pinging '$report_host' has returned: '$out' (pid=$pid alive, restarts=$restarts)"
+        echo -n .
+        sleep 1
+    done
+
+    log "INFO" "mysql daemon is ready to use......."
 
     # Set read-only immediately after MySQL starts to prevent any external
     # process from writing local GTIDs before the node joins the cluster.
