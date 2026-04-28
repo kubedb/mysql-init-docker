@@ -12,6 +12,7 @@
 #   5. REQUIRE SSL is strictly enforced on socket connections (repl can't connect locally)
 
 env | sort | grep "POD\|HOST\|NAME"
+echo "running">/scripts/setup.txt
 RECOVERY_DONE_FILE="/tmp/recovery.done"
 if [[ "$PITR_RESTORE" == "true" ]]; then
     while true; do
@@ -480,6 +481,7 @@ while true; do
     fi
 
     log "INFO" "waiting for mysql process id = $pid"
-    wait $pid
     rm -rf /scripts/signal.txt
+    rm -rf /scripts/setup.txt
+    wait $pid
 done

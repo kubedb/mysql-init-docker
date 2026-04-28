@@ -15,7 +15,10 @@
 #   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
 #   PRIMARY_TYPE        = defines single/multi primary
 
+
+
 env | sort | grep "POD\|HOST\|NAME"
+echo "running">/scripts/setup.txt
 RECOVERY_DONE_FILE="/tmp/recovery.done"
 if [[ "$PITR_RESTORE" == "true" ]]; then
     while true; do
@@ -640,5 +643,6 @@ while true; do
     fi
     joining_for_first_time=0
     log "INFO" "waiting for mysql process id  = $pid"
+    rm -rf /scripts/setup.txt
     wait $pid
 done
