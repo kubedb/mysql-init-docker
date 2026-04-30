@@ -606,6 +606,8 @@ install_group_replication_plugin
 install_clone_plugin
 
 while true; do
+    echo "running">/scripts/setup.txt
+    log "INFO" "creating setup.txt file"
     kill -0 $pid
     exit="$?"
     if [[ "$exit" == "0" ]]; then
@@ -641,7 +643,8 @@ while true; do
         join_by_clone
     fi
     joining_for_first_time=0
-    log "INFO" "waiting for mysql process id  = $pid"
+    log "INFO" "removing setup.txt file"
     rm -rf /scripts/setup.txt
+    log "INFO" "waiting for mysql process id  = $pid"
     wait $pid
 done

@@ -391,6 +391,8 @@ function check_mysqld_alive() {
 }
 
 while true; do
+    echo "running">/scripts/setup.txt
+    log "INFO" "creating setup.txt file"
     check_mysqld_alive
     if [[ "$mysqld_alive" == "1" ]]; then
         echo "mysqld process is running"
@@ -419,42 +421,43 @@ while true; do
     if [ ! -f "/scripts/signal.txt" ]; then
         log "INFO" "No signal to execute — node already joined via external reboot"
     else
-    desired_func=$(cat /scripts/signal.txt)
-    rm -rf /scripts/signal.txt
-    log "INFO" "going to execute $desired_func"
+        desired_func=$(cat /scripts/signal.txt)
+        rm -rf /scripts/signal.txt
+        log "INFO" "going to execute $desired_func"
 
-    if [[ $desired_func == "create_cluster" ]]; then
-        create_cluster
-    fi
+        if [[ $desired_func == "create_cluster" ]]; then
+            create_cluster
+        fi
 
-    if [[ $desired_func == "join_in_cluster" ]]; then
-        select_primary
-        join_in_cluster
-        check_instance_joined_in_cluster
-        if [[ "$joined_in_cluster" == "0" ]]; then
-            make_sure_instance_join_in_cluster
+        if [[ $desired_func == "join_in_cluster" ]]; then
+            select_primary
+            join_in_cluster
+            check_instance_joined_in_cluster
+            if [[ "$joined_in_cluster" == "0" ]]; then
+                make_sure_instance_join_in_cluster
+            fi
+        fi
+
+        if [[ $desired_func == "rejoin_in_cluster" ]]; then
+            select_primary
+            rejoin_in_cluster
+        fi
+        if [[ $desired_func == "join_by_clone" ]]; then
+            select_primary
+            join_by_clone
+            start_mysqld_in_background
+            wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
+            join_in_cluster
+        fi
+
+        if [[ $desired_func == "reboot_from_complete_outage" ]]; then
+            reboot_from_completeOutage
         fi
     fi
 
-    if [[ $desired_func == "rejoin_in_cluster" ]]; then
-        select_primary
-        rejoin_in_cluster
-    fi
-    if [[ $desired_func == "join_by_clone" ]]; then
-        select_primary
-        join_by_clone
-        start_mysqld_in_background
-        wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
-        join_in_cluster
-    fi
-
-    if [[ $desired_func == "reboot_from_complete_outage" ]]; then
-        reboot_from_completeOutage
-    fi
-    fi
-
-    log "INFO" "waiting for mysql process id = $pid"
+    log "INFO" "removing setup.txt file"
     rm -rf /scripts/signal.txt
     rm -rf /scripts/setup.txt
+    log "INFO" "waiting for mysql process id = $pid"
     wait $pid
 done
