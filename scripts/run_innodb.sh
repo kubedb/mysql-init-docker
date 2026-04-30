@@ -395,10 +395,75 @@ function reboot_from_completeOutage() {
 
     # Temporarily disable read-only for reboot (match run.sh)
     ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
-    yes | $mysqlsh_self -e "dba.rebootClusterFromCompleteOutage('$clusterName',{force:true})"
+
+    # Determine whether the InnoDB Cluster metadata schema exists AND recognizes
+    # this instance's server_uuid. dba.rebootClusterFromCompleteOutage() requires
+    # both — without them mysqlsh fails with MYSQLSH 51300 ("function not
+    # available through a session to a standalone instance"), and the coordinator
+    # ends up looping the reboot signal forever. This happens after:
+    #   - the metadata schema was dropped (manually or by an upstream cleanup);
+    #   - a logical restore where the source's metadata referenced a different
+    #     cluster's pod hostnames / server_uuids (so this server_uuid is unknown
+    #     to the metadata that came along with the restore);
+    #   - any cluster recreation where IDC metadata was wiped.
+    local has_metadata known_instance my_uuid
+    has_metadata=$(${mysql_local} -N -e \
+        "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='mysql_innodb_cluster_metadata';" \
+        2>/dev/null || echo 0)
+    my_uuid=$(${mysql_local} -N -e "SELECT @@server_uuid;" 2>/dev/null)
+    known_instance=0
+    if [[ "$has_metadata" == "1" && -n "$my_uuid" ]]; then
+        known_instance=$(${mysql_local} -N -e \
+            "SELECT COUNT(*) FROM mysql_innodb_cluster_metadata.instances WHERE mysql_server_uuid='$my_uuid';" \
+            2>/dev/null || echo 0)
+    fi
+
+    if [[ "$has_metadata" == "1" && "$known_instance" == "1" ]]; then
+        # Normal path — metadata is present and recognises this instance.
+        log "INFO" "InnoDB Cluster metadata present; running rebootClusterFromCompleteOutage"
+        yes | $mysqlsh_self -e "dba.rebootClusterFromCompleteOutage('$clusterName',{force:true})"
+    else
+        # Fallback path — metadata is missing or stale. Recreate it so this
+        # node is recognised and the cluster can come back ONLINE without
+        # operator intervention.
+        log "WARN" "InnoDB Cluster metadata missing or does not recognise this server_uuid (has_metadata=$has_metadata, known_instance=$known_instance); falling back to createCluster"
+
+        # Drop any stale metadata schemas so createCluster starts clean.
+        # SQL_LOG_BIN=0 keeps these DDLs out of the binlog so peers don't
+        # replay them during the next round of recovery.
+        ${mysql_local} -N -e "
+            SET SQL_LOG_BIN=0;
+            DROP DATABASE IF EXISTS mysql_innodb_cluster_metadata;
+            DROP DATABASE IF EXISTS mysql_innodb_cluster_metadata_bkp;
+            DROP DATABASE IF EXISTS mysql_innodb_cluster_metadata_previous;
+            SET SQL_LOG_BIN=1;
+        " 2>/dev/null
+
+        # If GR is already running on at least one member, adopt the live
+        # group instead of bootstrapping a new one (preserves any post-outage
+        # writes already in flight). Otherwise plain createCluster will
+        # configure + bootstrap GR locally and seed metadata.
+        local gr_online
+        gr_online=$(${mysql_local} -N -e \
+            "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE';" \
+            2>/dev/null || echo 0)
+
+        local create_opts="multiPrimary:false,force:true"
+        if [[ "$PRIMARY_TYPE" == "Multi-Primary" ]]; then
+            create_opts="multiPrimary:true,force:true"
+        fi
+
+        if [[ "${gr_online}" -ge "1" ]]; then
+            log "INFO" "GR already ONLINE on some member; createCluster with adoptFromGR:true"
+            yes | $mysqlsh_self -e "dba.createCluster('$clusterName',{adoptFromGR:true,${create_opts}});"
+        else
+            log "INFO" "GR is OFFLINE everywhere; createCluster will bootstrap GR locally"
+            yes | $mysqlsh_self -e "dba.createCluster('$clusterName',{${create_opts}});"
+        fi
+    fi
+
     clear_stale_cluster_lock "${report_host}"
     yes | $mysqlsh_self -e "cluster = dba.getCluster(); cluster.rescan()"
-    wait $pid
 }
 
 function start_mysqld_in_background() {
