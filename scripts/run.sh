@@ -15,6 +15,7 @@
 #   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
 
 env | sort | grep "POD\|HOST\|NAME"
+echo "running">/scripts/setup.txt
 RECOVERY_DONE_FILE="/tmp/recovery.done"
 if [[ "$PITR_RESTORE" == "true" ]]; then
     while true; do
@@ -181,23 +182,31 @@ EOL
 # wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
     local mysql="$mysql_header --host=$localhost"
+    local max_restarts=60
+    local restarts=0
 
-    for i in {900..0}; do
+    while true; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            if (( restarts >= max_restarts )); then
+                log "ERROR" "mysqld (pid=$pid) died and exceeded $max_restarts restart attempts. Aborting."
+                exit 1
+            fi
+            restarts=$((restarts + 1))
+            log "ERROR" "mysqld (pid=$pid) is no longer running. Restart attempt $restarts/$max_restarts..."
+            start_mysqld_in_background
+            sleep 10
+            continue
+        fi
         out=$(${mysql} -N -e "select 1;" 2>/dev/null)
         log "INFO" "Attempt $i: Pinging '$report_host' has returned: '$out'...................................."
         if [[ "$out" == "1" ]]; then
             break
         fi
-
+        log "INFO" "Pinging '$report_host' has returned: '$out' (pid=$pid alive, restarts=$restarts)"
         echo -n .
         sleep 1
     done
 
-    if [[ "$i" == "0" ]]; then
-        echo ""
-        log "ERROR" "Server ${report_host} failed to start in 900 seconds............."
-        exit 1
-    fi
     log "INFO" "mysql daemon is ready to use......."
 
     # Set read-only immediately after MySQL starts to prevent any external
@@ -597,6 +606,8 @@ install_group_replication_plugin
 install_clone_plugin
 
 while true; do
+    echo "running">/scripts/setup.txt
+    log "INFO" "creating setup.txt file"
     kill -0 $pid
     exit="$?"
     if [[ "$exit" == "0" ]]; then
@@ -632,6 +643,8 @@ while true; do
         join_by_clone
     fi
     joining_for_first_time=0
+    log "INFO" "removing setup.txt file"
+    rm -rf /scripts/setup.txt
     log "INFO" "waiting for mysql process id  = $pid"
     wait $pid
 done
