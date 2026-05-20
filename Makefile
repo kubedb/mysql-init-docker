@@ -1,29 +1,51 @@
 SHELL=/bin/bash -o pipefail
 
-REGISTRY ?= kubedb
-BIN      := mysql-init
-IMAGE    := $(REGISTRY)/$(BIN)
-TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "")
+REGISTRY   ?= ghcr.io/kubedb
+BIN        ?= mysql-init
+IMAGE      := $(REGISTRY)/$(BIN)
+TAG        ?= $(shell git describe --tags --exact-match --abbrev=0 2>/dev/null || echo "")
 
+DOCKER_PLATFORMS := linux/amd64 linux/arm64
+PLATFORM         ?= linux/$(subst x86_64,amd64,$(subst aarch64,arm64,$(shell uname -m)))
+VERSION          = $(TAG)_$(subst /,_,$(PLATFORM))
 
-.PHONY: push
-push: container
-	docker push $(IMAGE):$(TAG)
+container-%:
+	@$(MAKE) container \
+	    --no-print-directory \
+	    PLATFORM=$(subst _,/,$*)
+
+push-%:
+	@$(MAKE) push \
+	    --no-print-directory \
+	    PLATFORM=$(subst _,/,$*)
+
+all-container: $(addprefix container-, $(subst /,_,$(DOCKER_PLATFORMS)))
+
+all-push: $(addprefix push-, $(subst /,_,$(DOCKER_PLATFORMS)))
 
 .PHONY: container
 container:
-	curl -fsSL -O https://github.com/kmodules/peer-finder/releases/download/v1.1.0/peer-finder-linux-amd64.tar.gz
-	tar -xzvf peer-finder-linux-amd64.tar.gz
-	mv peer-finder-linux-amd64 peer-finder
-	chmod +x peer-finder
-	chmod +x init-script/run.sh
-	find $$(pwd)/scripts -type f -exec chmod +x {} \;
-	docker build --pull -t $(IMAGE):$(TAG) .
-	rm peer-finder peer-finder-linux-amd64.tar.gz
+	@echo "container: $(IMAGE):$(VERSION)"
+	@docker buildx build --platform $(PLATFORM) --load --pull -t $(IMAGE):$(VERSION) -f Dockerfile .
+	@echo
+
+push: container
+	@docker push $(IMAGE):$(VERSION)
+	@echo "pushed: $(IMAGE):$(VERSION)"
+	@echo
+
+.PHONY: docker-manifest
+docker-manifest:
+	docker manifest create -a $(IMAGE):$(TAG) $(foreach PLATFORM,$(DOCKER_PLATFORMS),$(IMAGE):$(TAG)_$(subst /,_,$(PLATFORM)))
+	docker manifest push $(IMAGE):$(TAG)
+
+.PHONY: release
+release:
+	@$(MAKE) all-push docker-manifest --no-print-directory
 
 .PHONY: version
 version:
-	@echo ::set-output name=version::$(TAG)
+	@echo version=$(VERSION)
 
 .PHONY: fmt
 fmt:
@@ -42,5 +64,5 @@ ci: verify
 .PHONY: push-to-kind
 push-to-kind: container
 	@echo "Loading docker image into kind cluster...."
-	@kind load docker-image $(IMAGE):$(TAG)
+	@kind load docker-image $(IMAGE):$(VERSION)
 	@echo "Image has been pushed successfully into kind cluster."
