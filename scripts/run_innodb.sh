@@ -409,6 +409,25 @@ function create_cluster() {
     fi
 }
 
+# adopt_from_gr converts the pod's currently-running Group Replication group into
+# a managed InnoDB cluster IN PLACE, without tearing the group down or cloning.
+# Used when a GroupReplication database is transformed to InnoDBCluster: the group
+# is still ONLINE, so dba.createCluster(adoptFromGR:true) adopts every member and
+# preserves all data. Must run while GR is ONLINE (do not restart mysqld first).
+function adopt_from_gr() {
+    local mysqlsh_self="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD} -h${report_host}"
+    clusterName=$(echo -n $BASE_NAME | sed 's/-/_/g')
+    ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
+    local create_opts="multiPrimary:false,force:true"
+    if [[ "$PRIMARY_TYPE" == "Multi-Primary" ]]; then
+        create_opts="multiPrimary:true,force:true"
+    fi
+    log "INFO" "adopting existing GR group as an InnoDB cluster (adoptFromGR:true)"
+    retry 5 $mysqlsh_self -e "dba.createCluster('$clusterName',{adoptFromGR:true,${create_opts}});"
+    clear_stale_cluster_lock "${report_host}"
+    yes | $mysqlsh_self -e "cluster = dba.getCluster(); cluster.rescan()" 2>/dev/null
+}
+
 function fix_metadata_uuids() {
     # After a pod restart with data loss (PVC deleted), MySQL generates a new server_uuid.
     # The InnoDB Cluster metadata still has the old UUID, causing dba.getCluster() to fail
@@ -792,6 +811,10 @@ while true; do
 
         if [[ $desired_func == "reboot_from_complete_outage" ]]; then
             reboot_from_completeOutage
+        fi
+
+        if [[ $desired_func == "adopt_from_gr" ]]; then
+            adopt_from_gr
         fi
     fi
 
