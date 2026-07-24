@@ -19,11 +19,20 @@ env | sort | grep "POD\|HOST\|NAME"
 echo "running">/scripts/setup.txt
 
 # How long a joining member waits for a busy donor before giving up on it.
-# MySQL serves only one clone per donor, so members seeded at the same time
-# queue here. Seeding a large database can take many minutes, hence the
-# generous default ceiling.
+#
+# MySQL serves only one clone per donor, so members seeded at the same time queue
+# here and each one waits for however long the clones ahead of it take. That is a
+# function of the database size, the disk and the replica count — none of which
+# this script can know — so there is deliberately NO default ceiling: a wall-clock
+# limit sized for one database silently abandons the clone on a larger one, which
+# is the failure this retry exists to prevent.
+#
+# The bound belongs to the operation, not to this loop: MySQLOpsRequest
+# spec.timeout already fails the request if it takes too long. Set
+# CLONE_BUSY_MAX_WAIT to a number of seconds only if you specifically want a
+# per-donor cap; 0 (the default) waits as long as the donor stays busy.
 clone_busy_retry_interval=${CLONE_BUSY_RETRY_INTERVAL:-15}
-clone_busy_max_wait=${CLONE_BUSY_MAX_WAIT:-3600}
+clone_busy_max_wait=${CLONE_BUSY_MAX_WAIT:-0}
 
 # How often the progress of a running clone is written to the pod log.
 clone_progress_interval=${CLONE_PROGRESS_INTERVAL:-15}
@@ -674,8 +683,9 @@ function clone_from_donor() {
         fi
 
         if [[ "$error_message" == *"Too many concurrent clone operations"* ]]; then
-            if [[ $waited -ge $clone_busy_max_wait ]]; then
-                log "ERROR" "Donor $donor still busy after ${waited}s, giving up on this donor"
+            # 0 = wait indefinitely; the ops request timeout is the real bound.
+            if [[ $clone_busy_max_wait -gt 0 && $waited -ge $clone_busy_max_wait ]]; then
+                log "ERROR" "Donor $donor still busy after ${waited}s (CLONE_BUSY_MAX_WAIT), giving up on this donor"
                 return 1
             fi
             log "INFO" "Donor $donor is busy serving another clone, retrying in ${clone_busy_retry_interval}s (waited ${waited}s so far)"
