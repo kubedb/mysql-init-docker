@@ -17,6 +17,16 @@
 
 env | sort | grep "POD\|HOST\|NAME"
 echo "running">/scripts/setup.txt
+
+# How long a joining member waits for a busy donor before giving up on it.
+# MySQL serves only one clone per donor, so members seeded at the same time
+# queue here. Seeding a large database can take many minutes, hence the
+# generous default ceiling.
+clone_busy_retry_interval=${CLONE_BUSY_RETRY_INTERVAL:-15}
+clone_busy_max_wait=${CLONE_BUSY_MAX_WAIT:-3600}
+
+# How often the progress of a running clone is written to the pod log.
+clone_progress_interval=${CLONE_PROGRESS_INTERVAL:-15}
 RECOVERY_DONE_FILE="/tmp/recovery.done"
 if [[ "$PITR_RESTORE" == "true" ]]; then
     while true; do
@@ -603,10 +613,87 @@ function join_into_cluster() {
     echo "end join in cluster"
 }
 
+# log_clone_progress polls performance_schema.clone_progress and logs how far the
+# running CLONE INSTANCE has got. Seeding a large database takes many minutes
+# during which the pod looks idle, so without this there is no way to tell a
+# healthy long clone apart from a stuck one.
+#
+# CLONE INSTANCE blocks the connection that issued it, so this runs as a
+# background poller and is stopped once the clone returns.
+function log_clone_progress() {
+    local mysql="$mysql_header --host=$localhost"
+    while true; do
+        # FILE COPY is the stage that moves the data; the others are negligible.
+        progress=$(${mysql} -N -B -e "
+            SELECT CONCAT(
+                     STAGE, ' ',
+                     ROUND(100 * DATA / ESTIMATE, 1), '% (',
+                     ROUND(DATA / 1024 / 1024), ' MiB of ',
+                     ROUND(ESTIMATE / 1024 / 1024), ' MiB, ',
+                     ROUND(DATA_SPEED / 1024 / 1024), ' MiB/s)')
+              FROM performance_schema.clone_progress
+             WHERE ESTIMATE > 0 AND STATE <> 'Not Started'
+             ORDER BY ID DESC LIMIT 1;" 2>/dev/null)
+        if [[ -n "$progress" ]]; then
+            log "INFO" "Clone progress: $progress"
+        fi
+        sleep "$clone_progress_interval"
+    done
+}
+
+# clone_from_donor runs CLONE INSTANCE against a single donor and returns 0 only
+# when the clone actually succeeded.
+#
+# MySQL permits exactly ONE concurrent clone operation per donor
+# (error 3634: "Too many concurrent clone operations. Maximum allowed - 1.").
+# When several fresh members are seeded at the same time they race for the same
+# donor and every loser is rejected within milliseconds. That is a transient
+# "donor is busy" condition, not a real failure, so wait for the donor to become
+# free and try again instead of giving up.
+function clone_from_donor() {
+    local donor=$1
+    local mysql="$mysql_header --host=$localhost"
+    local waited=0
+
+    while true; do
+        log_clone_progress &
+        local progress_pid=$!
+
+        error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;" 2>&1)
+
+        kill "$progress_pid" 2>/dev/null
+        wait "$progress_pid" 2>/dev/null
+
+        # A successful clone ends with:
+        #   "ERROR 3707 (HY000): Restart server failed (mysqld is not managed by supervisor process)"
+        # which means the data was copied and mysqld must be started again manually.
+        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
+        log "INFO" "Clone error message: $error_message"
+        if [[ "$error_message" == *"mysqld is not managed by supervisor process"* ]]; then
+            return 0
+        fi
+
+        if [[ "$error_message" == *"Too many concurrent clone operations"* ]]; then
+            if [[ $waited -ge $clone_busy_max_wait ]]; then
+                log "ERROR" "Donor $donor still busy after ${waited}s, giving up on this donor"
+                return 1
+            fi
+            log "INFO" "Donor $donor is busy serving another clone, retrying in ${clone_busy_retry_interval}s (waited ${waited}s so far)"
+            sleep "$clone_busy_retry_interval"
+            waited=$((waited + clone_busy_retry_interval))
+            continue
+        fi
+
+        # any other error: this donor cannot serve us
+        return 1
+    done
+}
+
 function join_by_clone() {
     # member try to join into the existing group
     log "INFO" "The replica, ${report_host} is joining into the existing group..."
     local mysql="$mysql_header --host=$localhost"
+    local clone_done=0
 
     # Temporarily disable read-only for clone operations.
     # GR will manage read-only after START GROUP_REPLICATION.
@@ -621,17 +708,11 @@ function join_by_clone() {
     if [[ $valid_donor_found == 1 ]]; then
         for donor in ${donors[*]}; do
             log "INFO" "Cloning data from $donor to $report_host....."
-            error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;" 2>&1)
-            # we may get an error when the cloning process has finished like:
-            # ".ERROR 3707 (HY000) at line 1: Restart server failed (mysqld is not managed by supervisor process)"
-            # This error does not indicate a cloning failure.
-            # It means that the recipient MySQL server instance must be started again manually after the data is cloned
-            # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
-            log "INFO" "Clone error message: $error_message"
-            if [[ "$error_message" != *"mysqld is not managed by supervisor process"* ]]; then
+            if ! clone_from_donor "$donor"; then
                 # retry cloning process for next valid donor
                 continue
             fi
+            clone_done=1
 
             # wait for background process `mysqld` have been killed
             for i in {60..0}; do
@@ -652,6 +733,18 @@ function join_by_clone() {
 
         done
     fi
+
+    # join_by_clone is only signalled when this member must be seeded from a donor
+    # (the donor holds data this member does not have, or this member holds
+    # transactions the group does not). If no donor could serve the clone, joining
+    # the group anyway would put an EMPTY member ONLINE, where it is indistinguishable
+    # from a healthy secondary and silently serves empty reads. Refuse to join and
+    # let the coordinator re-issue the clone instead.
+    if [[ $clone_done == 0 ]]; then
+        log "ERROR" "Clone failed from every donor; refusing to join the group with an empty dataset. The coordinator will retry."
+        return 1
+    fi
+
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
         retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
