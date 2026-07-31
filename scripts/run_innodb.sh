@@ -264,6 +264,43 @@ mysql_local="mysql -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD}
 mysqlsh_local="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD}"
 replication_user=repl
 
+clone_progress_interval=${CLONE_PROGRESS_INTERVAL:-15}
+
+# dba.addInstance waits dba.restartWaitTimeout seconds for the post-clone restart.
+# Raising it does not help: the clone's self-RESTART fails immediately (MY-013462,
+# nothing supervises mysqld in the container) and Group Replication evicts the
+# member on that error before any restart wait is consulted. Left at the default.
+dba_restart_wait_timeout=${DBA_RESTART_WAIT_TIMEOUT:-60}
+
+# log_clone_progress polls performance_schema.clone_progress and logs how far the
+# running clone has got. Mirrors the GroupReplication path in run.sh: seeding a
+# large database takes many minutes during which the pod looks idle, so without
+# this a healthy long clone is indistinguishable from a stuck one.
+#
+# The clone is driven by dba.addInstance against the primary, but the data is
+# written by the joining instance — this script's own host — so the progress rows
+# are local. addInstance blocks until the clone finishes, so this runs as a
+# background poller and is stopped once the call returns.
+function log_clone_progress() {
+    while true; do
+        # FILE COPY is the stage that moves the data; the others are negligible.
+        progress=$(${mysql_local} -N -B -e "
+            SELECT CONCAT(
+                     STAGE, ' ',
+                     ROUND(100 * DATA / ESTIMATE, 1), '% (',
+                     ROUND(DATA / 1024 / 1024), ' MiB of ',
+                     ROUND(ESTIMATE / 1024 / 1024), ' MiB, ',
+                     ROUND(DATA_SPEED / 1024 / 1024), ' MiB/s)')
+              FROM performance_schema.clone_progress
+             WHERE ESTIMATE > 0 AND STATE <> 'Not Started'
+             ORDER BY ID DESC LIMIT 1;" 2>/dev/null)
+        if [[ -n "$progress" ]]; then
+            log "INFO" "Clone progress: $progress"
+        fi
+        sleep "$clone_progress_interval"
+    done
+}
+
 # Kill any stale mysqlsh AdminAPI session holding the cluster-wide EXCLUSIVE lock
 # on $1 (usually the primary). A session holding AdminAPI_lock while in Sleep
 # state means a previous mysqlsh call died without releasing — rescan/addInstance/
@@ -561,6 +598,9 @@ function join_in_cluster() {
     # this, dba.getCluster() raises "unmanaged replication group" and addInstance
     # loops forever.
     fix_metadata_uuids
+    # After a clone the instance restarts and rejoins the group on its own; it is
+    # then a member AdminAPI does not know about and addInstance would reject it.
+    leave_group_if_unmanaged
     # Temporarily disable read-only for join operations (match run.sh)
     ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     clear_stale_cluster_lock "${primary}"
@@ -578,9 +618,61 @@ function join_by_clone() {
     clear_stale_cluster_lock "${primary}"
     retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.removeInstance('${report_host}:3306',{force:true});"
     clear_stale_cluster_lock "${primary}"
-    retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{recoveryMethod:'clone'});"
+    # Report clone progress while addInstance blocks, and give the post-clone
+    # restart room to finish instead of the 60s default.
+    log_clone_progress &
+    local progress_pid=$!
+    retry 10 ${mysqlsh_primary} -e "
+        shell.options['dba.restartWaitTimeout'] = ${dba_restart_wait_timeout};
+        cluster = dba.getCluster();
+        cluster.addInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{recoveryMethod:'clone'});"
+    kill "$progress_pid" 2>/dev/null
+    wait "$progress_pid" 2>/dev/null
     # Clone restarts mysqld — wait for the old process to finish
     wait $pid
+}
+
+# metadata_schema_exists is true once mysql_innodb_cluster_metadata has been
+# replicated to this instance, i.e. the group this member sits in is an
+# AdminAPI-managed InnoDB cluster rather than a plain Group Replication group.
+function metadata_schema_exists() {
+    local count
+    count=$(${mysql_local} -N -B -e "
+        SELECT COUNT(*) FROM information_schema.schemata
+         WHERE schema_name = 'mysql_innodb_cluster_metadata';" 2>/dev/null)
+    [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]
+}
+
+# is_registered_in_metadata is true when this instance's own address is recorded
+# in the cluster metadata. A member can be ONLINE in the group and still be
+# absent here — see the signal loop for how that happens and why it is fatal.
+function is_registered_in_metadata() {
+    local count
+    count=$(${mysql_local} -N -B -e "
+        SELECT COUNT(*) FROM mysql_innodb_cluster_metadata.instances
+         WHERE address = '${report_host}:3306';" 2>/dev/null)
+    [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]
+}
+
+# leave_group_if_unmanaged stops Group Replication when this instance is a group
+# member the cluster metadata does not know about. mysqld rejoins the group on
+# boot by itself, so after the post-clone restart the instance is back in the
+# group before AdminAPI ever recorded it — and addInstance then refuses it
+# ("already part of a Replication Group") while dba.getCluster() against it
+# fails ("unmanaged replication group"). Leaving the group first turns the
+# instance back into a plain joiner that addInstance can accept.
+function leave_group_if_unmanaged() {
+    local state
+    state=$(${mysql_local} -N -e "
+        SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+         WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
+    if [[ -z "$state" || "$state" == "OFFLINE" ]]; then
+        return
+    fi
+    if metadata_schema_exists && ! is_registered_in_metadata; then
+        log "WARNING" "in the group ($state) but absent from the InnoDB Cluster metadata — leaving the group so the AdminAPI join can register it"
+        ${mysql_local} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null
+    fi
 }
 
 joined_in_cluster=0
@@ -785,8 +877,26 @@ while true; do
         member_state=$(mysql -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} -N -e \
             "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
         if [[ "$member_state" == "ONLINE" ]]; then
-            log "INFO" "Already ONLINE in GR group (joined by another node's reboot) — skipping signal wait"
-            break
+            # Being ONLINE in the group is NOT the same as being known to the
+            # AdminAPI. cluster.addInstance(recoveryMethod:'clone') restarts the
+            # joining instance once the clone finishes, and mysqld rejoins the
+            # group by itself on boot (group_replication_start_on_boot) — often
+            # before the coordinator has written the join signal, and always
+            # before addInstance got the chance to record the instance in
+            # mysql_innodb_cluster_metadata. Breaking out here would leave a
+            # group member the cluster metadata does not contain, and from then
+            # on dba.getCluster() against this member fails with "unmanaged
+            # replication group", so no further pod can ever join.
+            #
+            # Stop GR instead and fall through to the signal-driven join, which
+            # goes through addInstance and does register the instance. The
+            # datadir is kept, so that join is incremental, not another clone.
+            if metadata_schema_exists && ! is_registered_in_metadata; then
+                leave_group_if_unmanaged
+            else
+                log "INFO" "Already ONLINE in GR group (joined by another node's reboot) — skipping signal wait"
+                break
+            fi
         fi
         log "WARNING" "signal is not present yet!"
         sleep 1
@@ -834,6 +944,20 @@ while true; do
     log "INFO" "removing setup.txt file"
     rm -rf /scripts/signal.txt
     rm -rf /scripts/setup.txt
+
+    # A join that exhausted its retries must not be terminal. The coordinator
+    # keeps re-issuing the signal, but blocking on the mysqld pid below means
+    # this loop never reads it again — the pod stays Running and out of the
+    # group until someone deletes it by hand. If we are still not a group
+    # member, re-arm and wait for the next signal instead.
+    member_state=$(${mysql_local} -N -e \
+        "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
+    if [[ "$member_state" != "ONLINE" ]]; then
+        log "WARNING" "not ONLINE in the group after handling the signal — waiting for the coordinator to signal again"
+        sleep 10
+        continue
+    fi
+
     log "INFO" "waiting for mysql process id = $pid"
     wait $pid
 done
