@@ -357,6 +357,42 @@ function create_replication_user() {
         # Grant it separately so failure on older versions doesn't break the script.
         ${mysql_local} -N -e "SET SQL_LOG_BIN=0; SET GLOBAL super_read_only=OFF; GRANT TRANSACTION_GTID_TAG ON *.* TO '${replication_user}'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES; SET GLOBAL super_read_only=ON; SET SQL_LOG_BIN=1;" 2>/dev/null
     fi
+
+    # Ensure the InnoDB Cluster privileges on EVERY start, not only when the
+    # replication user is created.
+    #
+    # A standalone -> InnoDBCluster promotion preserves the data directory by
+    # design, so ${replication_user} already exists there — created by run.sh with
+    # only REPLICATION SLAVE and BACKUP_ADMIN. The creation branch above is guarded
+    # on the user not existing, so on a promoted database it is skipped and the
+    # InnoDB-specific grants are never issued. MySQL Router bootstraps as this user
+    # and then loops forever on:
+    #
+    #   Error executing MySQL query "SELECT * FROM mysql_innodb_cluster_metadata.schema_version":
+    #   SELECT command denied to user 'repl'@'...' for table 'schema_version' (1142)
+    #
+    # leaving the Router never Ready and — because the primary Service selects the
+    # Router for InnoDBCluster — the database unreachable, even though the members
+    # are ONLINE and writable.
+    #
+    # GRANT is idempotent, so re-issuing on an already-granted user is a no-op.
+    log "INFO" "Ensuring replication user has the InnoDB Cluster privileges..."
+    retry 60 ${mysql_local} -N -e "
+        SET SQL_LOG_BIN=0;
+        SET GLOBAL super_read_only=OFF;
+        SET GLOBAL read_only=OFF;
+        GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT DELETE, INSERT, UPDATE ON mysql.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_bkp.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_previous.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT CLONE_ADMIN, BACKUP_ADMIN, CONNECTION_ADMIN, EXECUTE, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN, REPLICATION_APPLIER, REPLICATION_SLAVE_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN ON *.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        FLUSH PRIVILEGES;
+        SET GLOBAL read_only=ON;
+        SET GLOBAL super_read_only=ON;
+        SET SQL_LOG_BIN=1;
+    "
+
     touch /scripts/ready.txt
 }
 
