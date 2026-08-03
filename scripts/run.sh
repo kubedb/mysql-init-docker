@@ -841,6 +841,26 @@ while true; do
     joining_for_first_time=0
     log "INFO" "removing setup.txt file"
     rm -rf /scripts/setup.txt
+
+    # A join that did not take must not be terminal. `wait $pid` below only
+    # returns when mysqld exits, so a healthy mysqld parks this loop forever and
+    # every later signal the coordinator writes — including the create_cluster
+    # signal that re-bootstraps the group after a full outage — is never read.
+    # Observed: all members down, the coordinator decided on a bootstrap after
+    # ~16 minutes, wrote the signal, and it sat unread while the members went on
+    # failing to *join* a group that no longer existed; recovery needed a manual
+    # bootstrap.
+    #
+    # If this member is not ONLINE in the group, re-arm and wait for the next
+    # signal instead of blocking. Mirrors the same guard in run_innodb.sh.
+    member_state=$(${mysql_header} --host=$localhost -N -e \
+        "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
+    if [[ "$member_state" != "ONLINE" ]]; then
+        log "WARNING" "not ONLINE in the group after handling the signal (state='${member_state:-unknown}') — waiting for the coordinator to signal again"
+        sleep 10
+        continue
+    fi
+
     log "INFO" "waiting for mysql process id  = $pid"
     wait $pid
 done
