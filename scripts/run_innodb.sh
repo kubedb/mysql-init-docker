@@ -266,9 +266,6 @@ replication_user=repl
 
 clone_progress_interval=${CLONE_PROGRESS_INTERVAL:-15}
 
-# How often the Multi-Primary writability watcher re-checks this member.
-multi_primary_rw_interval=${MULTI_PRIMARY_RW_CHECK_INTERVAL:-10}
-
 # dba.addInstance waits dba.restartWaitTimeout seconds for the post-clone restart.
 # Raising it does not help: the clone's self-RESTART fails immediately (MY-013462,
 # nothing supervises mysqld in the container) and Group Replication evicts the
@@ -865,20 +862,6 @@ function ensure_multi_primary_writable() {
     fi
 }
 
-# multi_primary_writability_watcher keeps the guard applied for the life of the
-# pod. Clearing the flags once after this member joins is not enough: a later
-# cluster.addInstance()/rescan() driven from *another* pod re-enables
-# super_read_only on this one too, and by then this script is parked in
-# `wait $pid` and would never notice.
-function multi_primary_writability_watcher() {
-    [[ "$PRIMARY_TYPE" == "Multi-Primary" ]] || return 0
-    log "INFO" "starting Multi-Primary writability watcher (interval ${multi_primary_rw_interval}s)"
-    while true; do
-        ensure_multi_primary_writable
-        sleep "${multi_primary_rw_interval}"
-    done
-}
-
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
     # Use docker-entrypoint.sh (in PATH at /usr/local/bin/) — works on both
@@ -899,9 +882,6 @@ if [[ "$restart_required" == "1" ]]; then
     start_mysqld_in_background
     wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
 fi
-
-# Runs for the life of the pod; a no-op unless PRIMARY_TYPE is Multi-Primary.
-multi_primary_writability_watcher &
 
 mysqld_alive=0
 function check_mysqld_alive() {
@@ -1004,10 +984,12 @@ while true; do
     rm -rf /scripts/signal.txt
     rm -rf /scripts/setup.txt
 
-    # The join just finished, so this is the earliest point at which the
-    # AdminAPI's super_read_only can be undone. The watcher would get there
-    # too, up to one interval later; doing it here keeps the member writable
-    # from the moment it reports ONLINE.
+    # The join has finished, so this is the point at which the AdminAPI has
+    # done whatever it is going to do to super_read_only. One clear here is
+    # enough: the flag is only ever re-enabled as part of THIS member's own
+    # join, never by a later join from another pod. Verified by scaling a
+    # Multi-Primary cluster from 3 to 4 members with no watcher running at
+    # all -- every member, old and new, stayed 0/0 and writable.
     ensure_multi_primary_writable
 
     log "INFO" "waiting for mysql process id = $pid"
