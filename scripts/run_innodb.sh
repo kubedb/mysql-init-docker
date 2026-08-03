@@ -1004,19 +1004,6 @@ while true; do
     rm -rf /scripts/signal.txt
     rm -rf /scripts/setup.txt
 
-    # A join that exhausted its retries must not be terminal. The coordinator
-    # keeps re-issuing the signal, but blocking on the mysqld pid below means
-    # this loop never reads it again — the pod stays Running and out of the
-    # group until someone deletes it by hand. If we are still not a group
-    # member, re-arm and wait for the next signal instead.
-    member_state=$(${mysql_local} -N -e \
-        "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
-    if [[ "$member_state" != "ONLINE" ]]; then
-        log "WARNING" "not ONLINE in the group after handling the signal — waiting for the coordinator to signal again"
-        sleep 10
-        continue
-    fi
-
     # The join just finished, so this is the earliest point at which the
     # AdminAPI's super_read_only can be undone. The watcher would get there
     # too, up to one interval later; doing it here keeps the member writable
