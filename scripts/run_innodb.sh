@@ -266,6 +266,9 @@ replication_user=repl
 
 clone_progress_interval=${CLONE_PROGRESS_INTERVAL:-15}
 
+# How often the Multi-Primary writability watcher re-checks this member.
+multi_primary_rw_interval=${MULTI_PRIMARY_RW_CHECK_INTERVAL:-10}
+
 # dba.addInstance waits dba.restartWaitTimeout seconds for the post-clone restart.
 # Raising it does not help: the clone's self-RESTART fails immediately (MY-013462,
 # nothing supervises mysqld in the container) and Group Replication evicts the
@@ -823,6 +826,59 @@ function reboot_from_completeOutage() {
     wait $pid
 }
 
+# ── Multi-Primary writability guard ──────────────────────────────────────────
+#
+# In a Multi-Primary cluster every ONLINE member is a PRIMARY and must accept
+# writes. Two things leave it read-only anyway:
+#
+#   * wait_for_host_online() sets read_only/super_read_only ON on every start,
+#     so an unjoined member cannot generate errant GTIDs;
+#   * the AdminAPI re-enables super_read_only on an instance it has just added.
+#     It does that unconditionally, about a second after Group Replication
+#     itself cleared it (observed: super_read_only last set by user `repl`,
+#     0.7s after GR logged MY-011566 "Setting super_read_only=OFF").
+#
+# Group Replication only ever clears super_read_only when it declares a member
+# online, and never touches read_only. The member therefore ends up writable to
+# SUPER users but read-only to everyone else, while cluster.status() still
+# advertises it as R/W — so the Router routes writes to it and every write from
+# an ordinary application user fails with ER_OPTION_PREVENTS_STATEMENT (1290).
+#
+# Single-Primary is unaffected: there a read-only secondary is correct, and this
+# guard never runs.
+function ensure_multi_primary_writable() {
+    [[ "$PRIMARY_TYPE" == "Multi-Primary" ]] || return 0
+
+    local state flags
+    state=$(${mysql_local} -N -e "
+        SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+         WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
+    # Only an ONLINE member is a primary. While it is still joining, cloning or
+    # recovering the read-only state is deliberate — leave it alone.
+    [[ "$state" == "ONLINE" ]] || return 0
+
+    flags=$(${mysql_local} -N -e "SELECT @@read_only + @@super_read_only;" 2>/dev/null)
+    [[ "$flags" =~ ^[0-9]+$ ]] || return 0
+    if [[ "$flags" -gt 0 ]]; then
+        log "INFO" "Multi-Primary member is ONLINE but read-only (read_only+super_read_only=$flags) — clearing both"
+        ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
+    fi
+}
+
+# multi_primary_writability_watcher keeps the guard applied for the life of the
+# pod. Clearing the flags once after this member joins is not enough: a later
+# cluster.addInstance()/rescan() driven from *another* pod re-enables
+# super_read_only on this one too, and by then this script is parked in
+# `wait $pid` and would never notice.
+function multi_primary_writability_watcher() {
+    [[ "$PRIMARY_TYPE" == "Multi-Primary" ]] || return 0
+    log "INFO" "starting Multi-Primary writability watcher (interval ${multi_primary_rw_interval}s)"
+    while true; do
+        ensure_multi_primary_writable
+        sleep "${multi_primary_rw_interval}"
+    done
+}
+
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
     # Use docker-entrypoint.sh (in PATH at /usr/local/bin/) — works on both
@@ -843,6 +899,9 @@ if [[ "$restart_required" == "1" ]]; then
     start_mysqld_in_background
     wait_for_host_online "${MYSQL_ROOT_USERNAME}" "$report_host" "$MYSQL_ROOT_PASSWORD"
 fi
+
+# Runs for the life of the pod; a no-op unless PRIMARY_TYPE is Multi-Primary.
+multi_primary_writability_watcher &
 
 mysqld_alive=0
 function check_mysqld_alive() {
@@ -957,6 +1016,12 @@ while true; do
         sleep 10
         continue
     fi
+
+    # The join just finished, so this is the earliest point at which the
+    # AdminAPI's super_read_only can be undone. The watcher would get there
+    # too, up to one interval later; doing it here keeps the member writable
+    # from the moment it reports ONLINE.
+    ensure_multi_primary_writable
 
     log "INFO" "waiting for mysql process id = $pid"
     wait $pid
