@@ -264,6 +264,43 @@ mysql_local="mysql -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD}
 mysqlsh_local="mysqlsh --js -u${MYSQL_ROOT_USERNAME} -p${MYSQL_ROOT_PASSWORD}"
 replication_user=repl
 
+clone_progress_interval=${CLONE_PROGRESS_INTERVAL:-15}
+
+# dba.addInstance waits dba.restartWaitTimeout seconds for the post-clone restart.
+# Raising it does not help: the clone's self-RESTART fails immediately (MY-013462,
+# nothing supervises mysqld in the container) and Group Replication evicts the
+# member on that error before any restart wait is consulted. Left at the default.
+dba_restart_wait_timeout=${DBA_RESTART_WAIT_TIMEOUT:-60}
+
+# log_clone_progress polls performance_schema.clone_progress and logs how far the
+# running clone has got. Mirrors the GroupReplication path in run.sh: seeding a
+# large database takes many minutes during which the pod looks idle, so without
+# this a healthy long clone is indistinguishable from a stuck one.
+#
+# The clone is driven by dba.addInstance against the primary, but the data is
+# written by the joining instance — this script's own host — so the progress rows
+# are local. addInstance blocks until the clone finishes, so this runs as a
+# background poller and is stopped once the call returns.
+function log_clone_progress() {
+    while true; do
+        # FILE COPY is the stage that moves the data; the others are negligible.
+        progress=$(${mysql_local} -N -B -e "
+            SELECT CONCAT(
+                     STAGE, ' ',
+                     ROUND(100 * DATA / ESTIMATE, 1), '% (',
+                     ROUND(DATA / 1024 / 1024), ' MiB of ',
+                     ROUND(ESTIMATE / 1024 / 1024), ' MiB, ',
+                     ROUND(DATA_SPEED / 1024 / 1024), ' MiB/s)')
+              FROM performance_schema.clone_progress
+             WHERE ESTIMATE > 0 AND STATE <> 'Not Started'
+             ORDER BY ID DESC LIMIT 1;" 2>/dev/null)
+        if [[ -n "$progress" ]]; then
+            log "INFO" "Clone progress: $progress"
+        fi
+        sleep "$clone_progress_interval"
+    done
+}
+
 # Kill any stale mysqlsh AdminAPI session holding the cluster-wide EXCLUSIVE lock
 # on $1 (usually the primary). A session holding AdminAPI_lock while in Sleep
 # state means a previous mysqlsh call died without releasing — rescan/addInstance/
@@ -357,6 +394,42 @@ function create_replication_user() {
         # Grant it separately so failure on older versions doesn't break the script.
         ${mysql_local} -N -e "SET SQL_LOG_BIN=0; SET GLOBAL super_read_only=OFF; GRANT TRANSACTION_GTID_TAG ON *.* TO '${replication_user}'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES; SET GLOBAL super_read_only=ON; SET SQL_LOG_BIN=1;" 2>/dev/null
     fi
+
+    # Ensure the InnoDB Cluster privileges on EVERY start, not only when the
+    # replication user is created.
+    #
+    # A standalone -> InnoDBCluster promotion preserves the data directory by
+    # design, so ${replication_user} already exists there — created by run.sh with
+    # only REPLICATION SLAVE and BACKUP_ADMIN. The creation branch above is guarded
+    # on the user not existing, so on a promoted database it is skipped and the
+    # InnoDB-specific grants are never issued. MySQL Router bootstraps as this user
+    # and then loops forever on:
+    #
+    #   Error executing MySQL query "SELECT * FROM mysql_innodb_cluster_metadata.schema_version":
+    #   SELECT command denied to user 'repl'@'...' for table 'schema_version' (1142)
+    #
+    # leaving the Router never Ready and — because the primary Service selects the
+    # Router for InnoDBCluster — the database unreachable, even though the members
+    # are ONLINE and writable.
+    #
+    # GRANT is idempotent, so re-issuing on an already-granted user is a no-op.
+    log "INFO" "Ensuring replication user has the InnoDB Cluster privileges..."
+    retry 60 ${mysql_local} -N -e "
+        SET SQL_LOG_BIN=0;
+        SET GLOBAL super_read_only=OFF;
+        SET GLOBAL read_only=OFF;
+        GRANT CREATE USER, FILE, PROCESS, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE, SELECT, SHUTDOWN, SUPER ON *.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT DELETE, INSERT, UPDATE ON mysql.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_bkp.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW, DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SHOW VIEW, TRIGGER, UPDATE ON mysql_innodb_cluster_metadata_previous.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        GRANT CLONE_ADMIN, BACKUP_ADMIN, CONNECTION_ADMIN, EXECUTE, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN, REPLICATION_APPLIER, REPLICATION_SLAVE_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN ON *.* TO '${replication_user}'@'%' WITH GRANT OPTION;
+        FLUSH PRIVILEGES;
+        SET GLOBAL read_only=ON;
+        SET GLOBAL super_read_only=ON;
+        SET SQL_LOG_BIN=1;
+    "
+
     touch /scripts/ready.txt
 }
 
@@ -525,6 +598,9 @@ function join_in_cluster() {
     # this, dba.getCluster() raises "unmanaged replication group" and addInstance
     # loops forever.
     fix_metadata_uuids
+    # After a clone the instance restarts and rejoins the group on its own; it is
+    # then a member AdminAPI does not know about and addInstance would reject it.
+    leave_group_if_unmanaged
     # Temporarily disable read-only for join operations (match run.sh)
     ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
     clear_stale_cluster_lock "${primary}"
@@ -542,9 +618,61 @@ function join_by_clone() {
     clear_stale_cluster_lock "${primary}"
     retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.removeInstance('${report_host}:3306',{force:true});"
     clear_stale_cluster_lock "${primary}"
-    retry 10 ${mysqlsh_primary} -e "cluster = dba.getCluster(); cluster.addInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{recoveryMethod:'clone'});"
+    # Report clone progress while addInstance blocks, and give the post-clone
+    # restart room to finish instead of the 60s default.
+    log_clone_progress &
+    local progress_pid=$!
+    retry 10 ${mysqlsh_primary} -e "
+        shell.options['dba.restartWaitTimeout'] = ${dba_restart_wait_timeout};
+        cluster = dba.getCluster();
+        cluster.addInstance('${replication_user}:${MYSQL_ROOT_PASSWORD}@${report_host}:3306',{recoveryMethod:'clone'});"
+    kill "$progress_pid" 2>/dev/null
+    wait "$progress_pid" 2>/dev/null
     # Clone restarts mysqld — wait for the old process to finish
     wait $pid
+}
+
+# metadata_schema_exists is true once mysql_innodb_cluster_metadata has been
+# replicated to this instance, i.e. the group this member sits in is an
+# AdminAPI-managed InnoDB cluster rather than a plain Group Replication group.
+function metadata_schema_exists() {
+    local count
+    count=$(${mysql_local} -N -B -e "
+        SELECT COUNT(*) FROM information_schema.schemata
+         WHERE schema_name = 'mysql_innodb_cluster_metadata';" 2>/dev/null)
+    [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]
+}
+
+# is_registered_in_metadata is true when this instance's own address is recorded
+# in the cluster metadata. A member can be ONLINE in the group and still be
+# absent here — see the signal loop for how that happens and why it is fatal.
+function is_registered_in_metadata() {
+    local count
+    count=$(${mysql_local} -N -B -e "
+        SELECT COUNT(*) FROM mysql_innodb_cluster_metadata.instances
+         WHERE address = '${report_host}:3306';" 2>/dev/null)
+    [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]
+}
+
+# leave_group_if_unmanaged stops Group Replication when this instance is a group
+# member the cluster metadata does not know about. mysqld rejoins the group on
+# boot by itself, so after the post-clone restart the instance is back in the
+# group before AdminAPI ever recorded it — and addInstance then refuses it
+# ("already part of a Replication Group") while dba.getCluster() against it
+# fails ("unmanaged replication group"). Leaving the group first turns the
+# instance back into a plain joiner that addInstance can accept.
+function leave_group_if_unmanaged() {
+    local state
+    state=$(${mysql_local} -N -e "
+        SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+         WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
+    if [[ -z "$state" || "$state" == "OFFLINE" ]]; then
+        return
+    fi
+    if metadata_schema_exists && ! is_registered_in_metadata; then
+        log "WARNING" "in the group ($state) but absent from the InnoDB Cluster metadata — leaving the group so the AdminAPI join can register it"
+        ${mysql_local} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null
+    fi
 }
 
 joined_in_cluster=0
@@ -695,6 +823,45 @@ function reboot_from_completeOutage() {
     wait $pid
 }
 
+# ── Multi-Primary writability guard ──────────────────────────────────────────
+#
+# In a Multi-Primary cluster every ONLINE member is a PRIMARY and must accept
+# writes. Two things leave it read-only anyway:
+#
+#   * wait_for_host_online() sets read_only/super_read_only ON on every start,
+#     so an unjoined member cannot generate errant GTIDs;
+#   * the AdminAPI re-enables super_read_only on an instance it has just added.
+#     It does that unconditionally, about a second after Group Replication
+#     itself cleared it (observed: super_read_only last set by user `repl`,
+#     0.7s after GR logged MY-011566 "Setting super_read_only=OFF").
+#
+# Group Replication only ever clears super_read_only when it declares a member
+# online, and never touches read_only. The member therefore ends up writable to
+# SUPER users but read-only to everyone else, while cluster.status() still
+# advertises it as R/W — so the Router routes writes to it and every write from
+# an ordinary application user fails with ER_OPTION_PREVENTS_STATEMENT (1290).
+#
+# Single-Primary is unaffected: there a read-only secondary is correct, and this
+# guard never runs.
+function ensure_multi_primary_writable() {
+    [[ "$PRIMARY_TYPE" == "Multi-Primary" ]] || return 0
+
+    local state flags
+    state=$(${mysql_local} -N -e "
+        SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+         WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
+    # Only an ONLINE member is a primary. While it is still joining, cloning or
+    # recovering the read-only state is deliberate — leave it alone.
+    [[ "$state" == "ONLINE" ]] || return 0
+
+    flags=$(${mysql_local} -N -e "SELECT @@read_only + @@super_read_only;" 2>/dev/null)
+    [[ "$flags" =~ ^[0-9]+$ ]] || return 0
+    if [[ "$flags" -gt 0 ]]; then
+        log "INFO" "Multi-Primary member is ONLINE but read-only (read_only+super_read_only=$flags) — clearing both"
+        ${mysql_local} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" 2>/dev/null
+    fi
+}
+
 function start_mysqld_in_background() {
     log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
     # Use docker-entrypoint.sh (in PATH at /usr/local/bin/) — works on both
@@ -749,8 +916,26 @@ while true; do
         member_state=$(mysql -u${MYSQL_ROOT_USERNAME} -hlocalhost -p${MYSQL_ROOT_PASSWORD} -N -e \
             "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST='${report_host}' LIMIT 1;" 2>/dev/null)
         if [[ "$member_state" == "ONLINE" ]]; then
-            log "INFO" "Already ONLINE in GR group (joined by another node's reboot) — skipping signal wait"
-            break
+            # Being ONLINE in the group is NOT the same as being known to the
+            # AdminAPI. cluster.addInstance(recoveryMethod:'clone') restarts the
+            # joining instance once the clone finishes, and mysqld rejoins the
+            # group by itself on boot (group_replication_start_on_boot) — often
+            # before the coordinator has written the join signal, and always
+            # before addInstance got the chance to record the instance in
+            # mysql_innodb_cluster_metadata. Breaking out here would leave a
+            # group member the cluster metadata does not contain, and from then
+            # on dba.getCluster() against this member fails with "unmanaged
+            # replication group", so no further pod can ever join.
+            #
+            # Stop GR instead and fall through to the signal-driven join, which
+            # goes through addInstance and does register the instance. The
+            # datadir is kept, so that join is incremental, not another clone.
+            if metadata_schema_exists && ! is_registered_in_metadata; then
+                leave_group_if_unmanaged
+            else
+                log "INFO" "Already ONLINE in GR group (joined by another node's reboot) — skipping signal wait"
+                break
+            fi
         fi
         log "WARNING" "signal is not present yet!"
         sleep 1
@@ -798,6 +983,15 @@ while true; do
     log "INFO" "removing setup.txt file"
     rm -rf /scripts/signal.txt
     rm -rf /scripts/setup.txt
+
+    # The join has finished, so this is the point at which the AdminAPI has
+    # done whatever it is going to do to super_read_only. One clear here is
+    # enough: the flag is only ever re-enabled as part of THIS member's own
+    # join, never by a later join from another pod. Verified by scaling a
+    # Multi-Primary cluster from 3 to 4 members with no watcher running at
+    # all -- every member, old and new, stayed 0/0 and writable.
+    ensure_multi_primary_writable
+
     log "INFO" "waiting for mysql process id = $pid"
     wait $pid
 done
