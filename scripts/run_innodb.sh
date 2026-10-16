@@ -863,10 +863,10 @@ function ensure_multi_primary_writable() {
 }
 
 function start_mysqld_in_background() {
-    log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
-    # Use docker-entrypoint.sh (in PATH at /usr/local/bin/) — works on both
-    # Oracle mysql-server images and appscode images.
-    docker-entrypoint.sh mysqld --user=root --report-host=$report_host --bind-address=* $args &
+    # Docker Hub based images ship docker-entrypoint.sh; Oracle Container Registry images (MySQL Enterprise) ship /entrypoint.sh.
+    entrypoint=$(command -v docker-entrypoint.sh || echo /entrypoint.sh)
+    log "INFO" "Starting mysql server with '$entrypoint mysqld $args'..."
+    "$entrypoint" mysqld --user=root --report-host=$report_host --bind-address=* $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
