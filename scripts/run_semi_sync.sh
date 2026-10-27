@@ -87,8 +87,10 @@ EOL
 export pid
 
 function start_mysqld_in_background() {
-    log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $args'..."
-    docker-entrypoint.sh mysqld $args &
+    # Docker Hub based images ship docker-entrypoint.sh; Oracle Container Registry images (MySQL Enterprise) ship /entrypoint.sh.
+    entrypoint=$(command -v docker-entrypoint.sh || echo /entrypoint.sh)
+    log "INFO" "Starting mysql server with '$entrypoint mysqld $args'..."
+    "$entrypoint" mysqld $args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
