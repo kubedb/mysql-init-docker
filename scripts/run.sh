@@ -14,6 +14,13 @@
 #   POD_IP              = IP address used to create whitelist CIDR. For HOST_ADDRESS_TYPE=DNS, it will be status.PodIP.
 #   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
 #   PRIMARY_TYPE        = defines single/multi primary
+#
+# DC-DR (cross data center disaster recovery) variables, all optional:
+#   SERVER_ID_OFFSET    = added to the ordinal based server_id so that the PetSets of two data centers never collide
+#   DCDR_ENABLED        = "true" to create the cross-DC channel user
+#   DCDR_USER           = name of the channel user (default dcdr)
+#   DCDR_PASSWORD       = password of the channel user
+#   DCDR_SEED_HOST      = Service of the ACTIVE data center's primary, the donor for the first seed of a passive DC
 
 env | sort | grep "POD\|HOST\|NAME"
 echo "running">/scripts/setup.txt
@@ -152,7 +159,8 @@ export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 # In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 2^32 − 1.
 # “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
-svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1))
+# SERVER_ID_OFFSET keeps the PetSets of different data centers apart (DC-DR); it is 0 otherwise.
+svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1 + ${SERVER_ID_OFFSET:-0}))
 echo "server_id =  $svr_id"
 
 localhost="127.0.0.1"
@@ -372,6 +380,37 @@ function create_replication_user() {
         "
     fi
     touch /scripts/ready.txt
+}
+
+# create_dcdr_user creates (or refreshes the password of) the user that the passive data center
+# uses for its cross-DC replication channel and as the donor user of a cross-DC CLONE.
+# Everything runs with SQL_LOG_BIN=0 so no local GTID is written (an errant GTID would stop this
+# member from ever following the other data center).
+function create_dcdr_user() {
+    if [[ "${DCDR_ENABLED:-false}" != "true" ]]; then
+        return 0
+    fi
+    local user="${DCDR_USER:-dcdr}"
+    if [[ -z "${DCDR_PASSWORD:-}" ]]; then
+        log "ERROR" "DCDR_ENABLED=true but DCDR_PASSWORD is empty"
+        return 1
+    fi
+    log "INFO" "Ensuring DC-DR channel user '${user}'......"
+    local mysql="$mysql_header --host=$localhost"
+    retry 60 ${mysql} -N -e "
+        SET SQL_LOG_BIN=0;
+        SET GLOBAL super_read_only=OFF;
+        SET GLOBAL read_only=OFF;
+        CREATE USER IF NOT EXISTS '${user}'@'%' IDENTIFIED BY '${DCDR_PASSWORD}' REQUIRE SSL;
+        ALTER USER '${user}'@'%' IDENTIFIED BY '${DCDR_PASSWORD}' REQUIRE SSL;
+        GRANT REPLICATION SLAVE ON *.* TO '${user}'@'%';
+        GRANT BACKUP_ADMIN ON *.* TO '${user}'@'%';
+        GRANT SELECT ON performance_schema.replication_group_members TO '${user}'@'%';
+        FLUSH PRIVILEGES;
+        SET GLOBAL read_only=ON;
+        SET GLOBAL super_read_only=ON;
+        SET SQL_LOG_BIN=1;
+    "
 }
 
 function install_group_replication_plugin() {
@@ -661,6 +700,9 @@ function log_clone_progress() {
 # free and try again instead of giving up.
 function clone_from_donor() {
     local donor=$1
+    # DC-DR: a cross-DC clone uses the channel user instead of the group's repl user
+    local clone_user=${2:-repl}
+    local clone_password=${3:-$MYSQL_ROOT_PASSWORD}
     local mysql="$mysql_header --host=$localhost"
     local waited=0
 
@@ -668,7 +710,7 @@ function clone_from_donor() {
         log_clone_progress &
         local progress_pid=$!
 
-        error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;" 2>&1)
+        error_message=$(${mysql} -N -e "CLONE INSTANCE FROM '${clone_user}'@'$donor':3306 IDENTIFIED BY '${clone_password}' REQUIRE SSL;" 2>&1)
 
         kill "$progress_pid" 2>/dev/null
         wait "$progress_pid" 2>/dev/null
@@ -771,6 +813,76 @@ function join_by_clone() {
     echo "end join in cluster"
 }
 
+# wait_for_mysqld_exit waits for the mysqld child to go away after a successful CLONE (mysqld is not
+# supervised, so the clone shuts it down). Returns 0 once mysqld is gone, 1 if it is still alive.
+function wait_for_mysqld_exit() {
+    local i
+    for i in {60..0}; do
+        if ! kill -0 $pid 2>/dev/null; then
+            return 0
+        fi
+        log "INFO" "Attempt $i: waiting for mysqld(process id=$pid) to exit after clone"
+        sleep 1
+    done
+    return 1
+}
+
+# seed_by_clone_then_create_cluster seeds the FIRST member of a passive data center. It clones the
+# active data center's primary (DCDR_SEED_HOST) and then bootstraps this data center's OWN group
+# from the cloned data, under this DC's own group name. The other members of the passive DC then
+# join the new group by the normal join_by_clone path.
+function seed_by_clone_then_create_cluster() {
+    local mysql="$mysql_header --host=$localhost"
+    if [[ -z "${DCDR_SEED_HOST:-}" ]]; then
+        log "ERROR" "DCDR_SEED_HOST is not set; cannot seed from the active data center"
+        return 1
+    fi
+    log "INFO" "Seeding ${report_host} by clone from the active data center (${DCDR_SEED_HOST})......"
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+    retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
+    if ! clone_from_donor "${DCDR_SEED_HOST}" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
+        log "ERROR" "Clone from ${DCDR_SEED_HOST} failed; refusing to bootstrap an empty group. The coordinator will retry."
+        return 1
+    fi
+    wait_for_mysqld_exit || { log "ERROR" "mysqld did not exit after clone"; return 1; }
+    start_mysqld_in_background
+    wait_for_mysqld_running
+    # the cloned GTIDs are the data: they must not be reset again
+    joining_for_first_time=0
+    bootstrap_cluster
+    log "INFO" "${report_host} bootstrapped its own group from the active data center's data"
+}
+
+# reseed_from_donor re-seeds THIS member from a donor: it leaves the group, clones the donor and
+# restarts mysqld, and leaves group replication stopped. The coordinator decides what comes next
+# (create_cluster on the designated member, join_by_clone on the others). The donor is read from
+# /scripts/dcdr-donor if present, else DCDR_SEED_HOST. CLONE is refused on a running group
+# member (error 3875), hence the STOP GROUP_REPLICATION.
+function reseed_from_donor() {
+    local mysql="$mysql_header --host=$localhost"
+    local donor
+    donor=$(cat /scripts/dcdr-donor 2>/dev/null || true)
+    donor=${donor:-${DCDR_SEED_HOST:-}}
+    if [[ -z "$donor" ]]; then
+        log "ERROR" "no donor for reseed (/scripts/dcdr-donor and DCDR_SEED_HOST are empty)"
+        return 1
+    fi
+    rm -f /scripts/dcdr-donor
+    log "INFO" "Re-seeding ${report_host} from ${donor}......"
+    ${mysql} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null || true
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+    retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
+    if ! clone_from_donor "$donor" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
+        log "ERROR" "Re-seed clone from ${donor} failed"
+        return 1
+    fi
+    wait_for_mysqld_exit || { log "ERROR" "mysqld did not exit after clone"; return 1; }
+    start_mysqld_in_background
+    wait_for_mysqld_running
+    joining_for_first_time=0
+    log "INFO" "${report_host} re-seeded from ${donor}; group replication left stopped"
+}
+
 export pid
 function start_mysqld_in_background() {
     # Docker Hub based images ship docker-entrypoint.sh; Oracle Container Registry images (MySQL Enterprise) ship /entrypoint.sh.
@@ -797,6 +909,9 @@ wait_for_mysqld_running
 # ensure replication user
 create_replication_user
 
+# DC-DR: ensure the cross-DC channel user
+create_dcdr_user
+
 # ensure replication plugin
 install_group_replication_plugin
 
@@ -804,6 +919,12 @@ install_group_replication_plugin
 install_clone_plugin
 
 while true; do
+    # DC-DR re-seed: while the coordinator holds /scripts/dcdr-pause, this script must neither
+    # restart mysqld nor start group replication.
+    while [ -f "/scripts/dcdr-pause" ]; do
+        log "INFO" "/scripts/dcdr-pause is present; holding"
+        sleep 2
+    done
     echo "running">/scripts/setup.txt
     log "INFO" "creating setup.txt file"
     kill -0 $pid
@@ -833,6 +954,12 @@ while true; do
         wait_for_primary "${member_hosts[*]}"
         set_valid_donors
         join_into_cluster
+    fi
+    if [[ $desired_func == "seed_by_clone_then_create_cluster" ]]; then
+        seed_by_clone_then_create_cluster
+    fi
+    if [[ $desired_func == "reseed_from_donor" ]]; then
+        reseed_from_donor
     fi
     if [[ $desired_func == "join_by_clone" ]]; then
         check_member_list_updated "${member_hosts[*]}"
