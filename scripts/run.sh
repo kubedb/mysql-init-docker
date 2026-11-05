@@ -647,12 +647,14 @@ function join_into_cluster() {
     fi
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
+        drop_dcdr_channel
         retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
+        drop_dcdr_channel
         retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
@@ -799,12 +801,14 @@ function join_by_clone() {
 
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
+        drop_dcdr_channel
         retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
+        drop_dcdr_channel
         retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
@@ -825,6 +829,25 @@ function allow_clone_donor() {
         list="$1:3306"
     fi
     retry 60 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='${list}';"
+}
+
+# drop_dcdr_channel removes the cross-DC replication channel from a member that is about to start
+# Group Replication as a SECONDARY. CLONE copies the donor's replication configuration, so a member
+# cloned from the passive data center's primary arrives with the dcdr channel, and Group Replication
+# refuses to start on a secondary while any asynchronous channel exists (error 3092 / "Can't start
+# group replication on secondary member with single-primary mode while asynchronous replication
+# channels are running"). The channel belongs on the group primary only; the coordinator creates it
+# there.
+function drop_dcdr_channel() {
+    if [[ "${DCDR_ENABLED:-false}" != "true" ]]; then
+        return 0
+    fi
+    local mysql="$mysql_header --host=$localhost"
+    if version_ge 8 4; then
+        ${mysql} -N -e "STOP REPLICA FOR CHANNEL 'dcdr'; RESET REPLICA ALL FOR CHANNEL 'dcdr';" 2>/dev/null || true
+    else
+        ${mysql} -N -e "STOP SLAVE FOR CHANNEL 'dcdr'; RESET SLAVE ALL FOR CHANNEL 'dcdr';" 2>/dev/null || true
+    fi
 }
 
 # refence puts the member back to read only after a failed seed. The seed lifts read only to allow the
