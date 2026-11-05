@@ -813,6 +813,28 @@ function join_by_clone() {
     echo "end join in cluster"
 }
 
+# allow_clone_donor puts a cross-DC donor into clone_valid_donor_list. CLONE refuses any donor that is
+# not listed (error 3869); the list set by set_valid_donors only knows the members of this group.
+function allow_clone_donor() {
+    local mysql="$mysql_header --host=$localhost"
+    local list
+    list=$(${mysql} -N -e "SELECT @@GLOBAL.clone_valid_donor_list;" 2>/dev/null | tr -d '\n')
+    if [[ -n "$list" && "$list" != "NULL" ]]; then
+        list="${list},$1:3306"
+    else
+        list="$1:3306"
+    fi
+    retry 60 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='${list}';"
+}
+
+# refence puts the member back to read only after a failed seed. The seed lifts read only to allow the
+# clone; leaving it lifted would leave a member of the passive data center writable while its group is
+# down, which is exactly what the fence exists to prevent.
+function refence() {
+    local mysql="$mysql_header --host=$localhost"
+    ${mysql} -N -e "SET GLOBAL super_read_only=ON; SET GLOBAL read_only=ON;" 2>/dev/null || true
+}
+
 # wait_for_mysqld_exit waits for the mysqld child to go away after a successful CLONE (mysqld is not
 # supervised, so the clone shuts it down). Returns 0 once mysqld is gone, 1 if it is still alive.
 function wait_for_mysqld_exit() {
@@ -838,9 +860,11 @@ function seed_by_clone_then_create_cluster() {
         return 1
     fi
     log "INFO" "Seeding ${report_host} by clone from the active data center (${DCDR_SEED_HOST})......"
+    allow_clone_donor "${DCDR_SEED_HOST}"
     retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
     retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
     if ! clone_from_donor "${DCDR_SEED_HOST}" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
+        refence
         log "ERROR" "Clone from ${DCDR_SEED_HOST} failed; refusing to bootstrap an empty group. The coordinator will retry."
         return 1
     fi
@@ -870,9 +894,11 @@ function reseed_from_donor() {
     rm -f /scripts/dcdr-donor
     log "INFO" "Re-seeding ${report_host} from ${donor}......"
     ${mysql} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null || true
+    allow_clone_donor "$donor"
     retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
     retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
     if ! clone_from_donor "$donor" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
+        refence
         log "ERROR" "Re-seed clone from ${donor} failed"
         return 1
     fi
