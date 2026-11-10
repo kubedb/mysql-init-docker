@@ -936,8 +936,22 @@ export pid
 function start_mysqld_in_background() {
     # Docker Hub based images ship docker-entrypoint.sh; Oracle Container Registry images (MySQL Enterprise) ship /entrypoint.sh.
     entrypoint=$(command -v docker-entrypoint.sh || echo /entrypoint.sh)
-    log "INFO" "Starting mysql server with '$entrypoint mysqld $args'..."
-    "$entrypoint" mysqld $args &
+    local fence_args=""
+    # An already initialized data directory means this is a restart (pod restart, or mysqld restarted in place
+    # after a crash). Boot fenced: until Group Replication elects this member primary it must not accept a
+    # single write, or the write becomes an errant GTID outside the group (split-brain, seen in DC-DR test T5).
+    # Also keep async channels stopped on boot; the coordinator starts the right channel against the right source.
+    # Not on the very first boot: --initialize and the entrypoint's init SQL need a writable server.
+    if [[ -d /var/lib/mysql/mysql ]]; then
+        fence_args="--super-read-only=ON"
+        if version_ge 8 1 || { [[ "$MYSQL_MAJOR" -eq 8 && "$MYSQL_MINOR" -eq 0 && "${MYSQL_PATCH%%[!0-9]*}" -ge 26 ]]; }; then
+            fence_args="$fence_args --skip-replica-start=ON"
+        else
+            fence_args="$fence_args --skip-slave-start"
+        fi
+    fi
+    log "INFO" "Starting mysql server with '$entrypoint mysqld $args $fence_args'..."
+    "$entrypoint" mysqld $args $fence_args &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
