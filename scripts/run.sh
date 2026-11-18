@@ -933,6 +933,23 @@ function reseed_from_donor() {
 }
 
 export pid
+# refresh_peers re-reads /scripts/peer-list, which the coordinator rewrites when the data center
+# grows (DC-DR scale up of a group that started with 1 member), and updates the hosts, the seeds
+# and group_replication_group_seeds. Without it a member that started alone keeps itself as its
+# only seed and peer after a mysqld restart.
+function refresh_peers() {
+    local h
+    h=$(cat /scripts/peer-list 2>/dev/null)
+    [[ -n "$h" ]] || return 0
+    IFS=', ' read -r -a peers <<<"$h"
+    export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
+    export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
+    member_hosts=($(echo -n ${peers[*]} | tr -d '[]'))
+    log "INFO" "peers: ${member_hosts[*]}"
+    ${mysql_header} --host=$localhost -N -e "SET GLOBAL group_replication_group_seeds='${seeds}';" ||
+        log "WARNING" "could not set group_replication_group_seeds to ${seeds}"
+}
+
 function start_mysqld_in_background() {
     # Docker Hub based images ship docker-entrypoint.sh; Oracle Container Registry images (MySQL Enterprise) ship /entrypoint.sh.
     entrypoint=$(command -v docker-entrypoint.sh || echo /entrypoint.sh)
@@ -1007,6 +1024,7 @@ while true; do
     done
     desired_func=$(cat /scripts/signal.txt)
     rm -rf /scripts/signal.txt
+    refresh_peers
     log "INFO" "going to execute $desired_func"
     if [[ $desired_func == "create_cluster" ]]; then
         bootstrap_cluster
