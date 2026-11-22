@@ -572,6 +572,38 @@ function set_valid_donors() {
     fi
 }
 
+# start_group_replication runs START GROUP_REPLICATION with the usual retries. If the start fails
+# because this member's group_replication_applier relay log is corrupt (MY-010596 / MY-013121,
+# seen after an unclean restart), every retry fails the same way and the member never comes up.
+# In that case it discards the applier relay log once and starts again.
+#
+# Discarding it is safe: the relay log only holds transactions this member received but had not
+# applied yet. A joiner fetches whatever it lacks from a donor during distributed recovery. A
+# bootstrap candidate is the member with the most executed transactions, and in single-primary
+# mode the primary commits before the others apply, so a transaction no member has executed is
+# not committed anywhere either. The discarded set is logged.
+function start_group_replication() {
+    local mysql="$mysql_header --host=$localhost"
+    local since corrupt unapplied
+    since=$(${mysql} -N -e "SELECT NOW(6);" 2>/dev/null)
+    if ${mysql} -N -e "START GROUP_REPLICATION;"; then
+        return 0
+    fi
+    corrupt=0
+    if [[ -n "$since" ]]; then
+        corrupt=$(${mysql} -N -e "SELECT COUNT(*) FROM performance_schema.error_log WHERE LOGGED >= '${since}' AND ERROR_CODE IN ('MY-010596','MY-013121') AND DATA LIKE '%group_replication_applier%';" 2>/dev/null || echo 0)
+    fi
+    if [[ "${corrupt:-0}" != "0" ]]; then
+        unapplied=$(${mysql} -N -e "SELECT GTID_SUBTRACT(RECEIVED_TRANSACTION_SET, @@global.gtid_executed) FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME='group_replication_applier';" 2>/dev/null | tr -d '\n')
+        log "WARNING" "group_replication_applier relay log is corrupt; discarding it (received but not applied: '${unapplied}')"
+        ${mysql} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null || true
+        if ! ${mysql} -N -e "RESET REPLICA FOR CHANNEL 'group_replication_applier';"; then
+            log "ERROR" "could not reset the group_replication_applier channel"
+        fi
+    fi
+    retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+}
+
 function bootstrap_cluster() {
     # for bootstrap group replication, the following steps have been taken:
     # - initially reset the member to cleanup all data configuration/set the binlog and gtid's initial position.
@@ -589,7 +621,7 @@ function bootstrap_cluster() {
         retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
     fi
     retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+    start_group_replication
     retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
 }
 
@@ -648,14 +680,14 @@ function join_into_cluster() {
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
         drop_dcdr_channel
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
         drop_dcdr_channel
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
@@ -802,14 +834,14 @@ function join_by_clone() {
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
         drop_dcdr_channel
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
         drop_dcdr_channel
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
