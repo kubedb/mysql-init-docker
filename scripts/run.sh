@@ -972,21 +972,28 @@ function wait_for_mysqld_exit() {
 # active data center's primary (DCDR_SEED_HOST) and then bootstraps this data center's OWN group
 # from the cloned data, under this DC's own group name. The other members of the passive DC then
 # join the new group by the normal join_by_clone path.
+#
+# The donor is /scripts/dcdr-donor when the coordinator wrote it (a brand new member of the ACTIVE
+# data center while another data center's primary holds the data), else DCDR_SEED_HOST.
 function seed_by_clone_then_create_cluster() {
     local mysql="$mysql_header --host=$localhost"
-    if [[ -z "${DCDR_SEED_HOST:-}" ]]; then
-        log "ERROR" "DCDR_SEED_HOST is not set; cannot seed from the active data center"
+    local donor
+    donor=$(cat /scripts/dcdr-donor 2>/dev/null || true)
+    donor=${donor:-${DCDR_SEED_HOST:-}}
+    if [[ -z "$donor" ]]; then
+        log "ERROR" "no donor (/scripts/dcdr-donor and DCDR_SEED_HOST are empty); cannot seed from another data center"
         return 1
     fi
-    log "INFO" "Seeding ${report_host} by clone from the active data center (${DCDR_SEED_HOST})......"
-    allow_clone_donor "${DCDR_SEED_HOST}"
+    log "INFO" "Seeding ${report_host} by clone from ${donor}......"
+    allow_clone_donor "${donor}"
     retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
     retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
-    if ! clone_from_donor "${DCDR_SEED_HOST}" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
+    if ! clone_from_donor "${donor}" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
         refence
-        log "ERROR" "Clone from ${DCDR_SEED_HOST} failed; refusing to bootstrap an empty group. The coordinator will retry."
+        log "ERROR" "Clone from ${donor} failed; refusing to bootstrap an empty group. The coordinator will retry."
         return 1
     fi
+    rm -f /scripts/dcdr-donor
     wait_for_mysqld_exit || { log "ERROR" "mysqld did not exit after clone"; return 1; }
     start_mysqld_in_background
     wait_for_mysqld_running
