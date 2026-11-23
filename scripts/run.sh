@@ -278,13 +278,71 @@ echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 } >>/etc/mysql/group-replication.conf.d/group.cnf
 
 # wait for mysql daemon be running (alive)
+mysqld_start_err=/tmp/mysqld-start.err
+corrupt_starts_before_wipe=3
+
+# datadir_corrupt reports whether the last mysqld start failed on corrupt InnoDB data: InnoDB aborted
+# with "Data structure corruption" (MY-012930) on a corrupt or zeroed page (MY-012237 / MY-012224 /
+# "Database page corruption"). Seen after the lab's storage outage (2026-11-22): ibdata1's header page
+# was all zeros. "Data Dictionary initialization failed" alone is NOT enough: a version downgrade or a
+# permission problem logs it too, and must never lead to a wipe.
+function datadir_corrupt() {
+    [[ -s "$mysqld_start_err" ]] || return 1
+    grep -q 'MY-012930' "$mysqld_start_err" &&
+        grep -qE 'MY-012237|MY-012224|Database page corruption' "$mysqld_start_err"
+}
+
+# wipe_corrupt_datadir empties /var/lib/mysql of a member whose InnoDB data is corrupt, so it starts
+# again as a new, empty member and is seeded by clone like any new member. A member that cannot start
+# otherwise blocks its whole data center: the bootstrap election waits for every member's answer.
+# The coordinator treats a member with an empty data directory as having nothing to lose.
+#
+# Only when another copy of the data is reachable: a peer of this data center that answers with
+# executed transactions, or (DC-DR) the active data center's primary (DCDR_SEED_HOST). Otherwise it
+# refuses and the member stays down for an operator.
+function wipe_corrupt_datadir() {
+    local h g copy=""
+    for h in "${member_hosts[@]}"; do
+        [[ "$h" == "$report_host" ]] && continue
+        g=$(timeout 10 ${mysql_header} --host="$h" -N -e "SELECT @@global.gtid_executed;" 2>/dev/null | tr -d '\n')
+        [[ -n "$g" ]] && { copy="$h (gtid_executed $g)"; break; }
+    done
+    if [[ -z "$copy" && -n "${DCDR_SEED_HOST:-}" && -n "${DCDR_PASSWORD:-}" ]]; then
+        g=$(MYSQL_PWD="$DCDR_PASSWORD" timeout 10 mysql -u "${DCDR_USER:-dcdr}" --port=3306 --host="$DCDR_SEED_HOST" -N -e "SELECT @@global.gtid_executed;" 2>/dev/null | tr -d '\n')
+        [[ -n "$g" ]] && copy="the active data center ${DCDR_SEED_HOST} (gtid_executed $g)"
+    fi
+    if [[ -z "$copy" ]]; then
+        log "ERROR" "InnoDB data is corrupt and no other copy is reachable (no peer answers, no active data center); NOT wiping, the member stays down"
+        return 1
+    fi
+    log "WARNING" "InnoDB data is corrupt; a copy is reachable on ${copy}. Wiping /var/lib/mysql so this member starts empty and is seeded by clone"
+    grep -E '\[ERROR\]' "$mysqld_start_err" | head -5 | while read -r l; do log "WARNING" "  last start: $l"; done
+    echo "$(timestamp) wiped corrupt datadir; copy on ${copy}" >> /scripts/datadir-wiped
+    find /var/lib/mysql -mindepth 1 -delete
+    return 0
+}
+
 function wait_for_mysqld_running() {
     local mysql="$mysql_header --host=$localhost"
     local max_restarts=60
     local restarts=0
+    local corrupt_starts=0
 
     while true; do
         if ! kill -0 "$pid" 2>/dev/null; then
+            if datadir_corrupt; then
+                corrupt_starts=$((corrupt_starts + 1))
+                log "ERROR" "mysqld failed to start: InnoDB data in /var/lib/mysql is corrupt ($corrupt_starts/$corrupt_starts_before_wipe)"
+                if (( corrupt_starts >= corrupt_starts_before_wipe )) && wipe_corrupt_datadir; then
+                    restarts=0
+                    corrupt_starts=0
+                    start_mysqld_in_background
+                    sleep 10
+                    continue
+                fi
+            else
+                corrupt_starts=0
+            fi
             if (( restarts >= max_restarts )); then
                 log "ERROR" "mysqld (pid=$pid) died and exceeded $max_restarts restart attempts. Aborting."
                 exit 1
@@ -1006,7 +1064,11 @@ function start_mysqld_in_background() {
         fi
     fi
     log "INFO" "Starting mysql server with '$entrypoint mysqld $args $fence_args'..."
-    "$entrypoint" mysqld $args $fence_args &
+    # stderr also goes to $mysqld_start_err (truncated per start), so a failed start can be diagnosed.
+    # Without MYSQL_PWD: on an empty data directory (first boot, or after wipe_corrupt_datadir) the
+    # entrypoint runs its init SQL as root with no password yet, and an inherited MYSQL_PWD (exported
+    # below, after the first start) fails it with "Access denied" and the entrypoint exits.
+    env -u MYSQL_PWD "$entrypoint" mysqld $args $fence_args 2> >(tee "$mysqld_start_err" >&2) &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
