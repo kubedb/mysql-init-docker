@@ -572,10 +572,13 @@ function set_valid_donors() {
     fi
 }
 
-# start_group_replication runs START GROUP_REPLICATION with the usual retries. If the start fails
-# because this member's group_replication_applier relay log is corrupt (MY-010596 / MY-013121,
-# seen after an unclean restart), every retry fails the same way and the member never comes up.
-# In that case it discards the applier relay log once and starts again.
+# start_group_replication runs START GROUP_REPLICATION with the usual retries. If this member's
+# group_replication_applier relay log is corrupt (MY-010596 / MY-013121, seen after an unclean
+# restart), the member never stays up: either START fails (ERROR 3092), or START returns OK and the
+# applier fails on the corrupt event a moment later and takes the member OFFLINE (lab, 2026-11-23).
+# So after every START it waits a few seconds and checks the error log, whatever START returned. On
+# corruption it discards the applier relay log once, clears the offline_mode GR set on the way out,
+# and starts again.
 #
 # Discarding it is safe: the relay log only holds transactions this member received but had not
 # applied yet. A joiner fetches whatever it lacks from a donor during distributed recovery. A
@@ -584,23 +587,26 @@ function set_valid_donors() {
 # not committed anywhere either. The discarded set is logged.
 function start_group_replication() {
     local mysql="$mysql_header --host=$localhost"
-    local since corrupt unapplied
+    local since corrupt unapplied started=0
     since=$(${mysql} -N -e "SELECT NOW(6);" 2>/dev/null)
-    if ${mysql} -N -e "START GROUP_REPLICATION;"; then
-        return 0
-    fi
+    ${mysql} -N -e "START GROUP_REPLICATION;" && started=1
     corrupt=0
     if [[ -n "$since" ]]; then
+        sleep 3
         corrupt=$(${mysql} -N -e "SELECT COUNT(*) FROM performance_schema.error_log WHERE LOGGED >= '${since}' AND ERROR_CODE IN ('MY-010596','MY-013121') AND DATA LIKE '%group_replication_applier%';" 2>/dev/null || echo 0)
     fi
-    if [[ "${corrupt:-0}" != "0" ]]; then
-        unapplied=$(${mysql} -N -e "SELECT GTID_SUBTRACT(RECEIVED_TRANSACTION_SET, @@global.gtid_executed) FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME='group_replication_applier';" 2>/dev/null | tr -d '\n')
-        log "WARNING" "group_replication_applier relay log is corrupt; discarding it (received but not applied: '${unapplied}')"
-        ${mysql} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null || true
-        if ! ${mysql} -N -e "RESET REPLICA FOR CHANNEL 'group_replication_applier';"; then
-            log "ERROR" "could not reset the group_replication_applier channel"
-        fi
+    if [[ "${corrupt:-0}" == "0" ]]; then
+        [[ $started == 1 ]] && return 0
+        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        return
     fi
+    unapplied=$(${mysql} -N -e "SELECT GTID_SUBTRACT(RECEIVED_TRANSACTION_SET, @@global.gtid_executed) FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME='group_replication_applier';" 2>/dev/null | tr -d '\n')
+    log "WARNING" "group_replication_applier relay log is corrupt; discarding it (received but not applied: '${unapplied}')"
+    ${mysql} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null || true
+    if ! ${mysql} -N -e "RESET REPLICA FOR CHANNEL 'group_replication_applier';"; then
+        log "ERROR" "could not reset the group_replication_applier channel"
+    fi
+    ${mysql} -N -e "SET GLOBAL offline_mode=OFF;" 2>/dev/null || true
     retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
 }
 
