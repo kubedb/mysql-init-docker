@@ -14,6 +14,13 @@
 #   POD_IP              = IP address used to create whitelist CIDR. For HOST_ADDRESS_TYPE=DNS, it will be status.PodIP.
 #   POD_IP_TYPE         = Address type of POD_IP (one of IPV4, IPv6)
 #   PRIMARY_TYPE        = defines single/multi primary
+#
+# DC-DR (cross data center disaster recovery) variables, all optional:
+#   SERVER_ID_OFFSET    = added to the ordinal based server_id so that the PetSets of two data centers never collide
+#   DCDR_ENABLED        = "true" to create the cross-DC channel user
+#   DCDR_USER           = name of the channel user (default dcdr)
+#   DCDR_PASSWORD       = password of the channel user
+#   DCDR_SEED_HOST      = Service of the ACTIVE data center's primary, the donor for the first seed of a passive DC
 
 env | sort | grep "POD\|HOST\|NAME"
 echo "running">/scripts/setup.txt
@@ -152,7 +159,8 @@ export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 # In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 2^32 − 1.
 # “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
-svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1))
+# SERVER_ID_OFFSET keeps the PetSets of different data centers apart (DC-DR); it is 0 otherwise.
+svr_id=$(($(echo -n "${HOSTNAME}" | sed -e "s/${BASE_NAME}-//g") + 1 + ${SERVER_ID_OFFSET:-0}))
 echo "server_id =  $svr_id"
 
 localhost="127.0.0.1"
@@ -270,13 +278,71 @@ echo "!includedir /etc/mysql/conf.d/" >>/etc/mysql/my.cnf
 } >>/etc/mysql/group-replication.conf.d/group.cnf
 
 # wait for mysql daemon be running (alive)
+mysqld_start_err=/tmp/mysqld-start.err
+corrupt_starts_before_wipe=3
+
+# datadir_corrupt reports whether the last mysqld start failed on corrupt InnoDB data: InnoDB aborted
+# with "Data structure corruption" (MY-012930) on a corrupt or zeroed page (MY-012237 / MY-012224 /
+# "Database page corruption"). Seen after the lab's storage outage (2026-11-22): ibdata1's header page
+# was all zeros. "Data Dictionary initialization failed" alone is NOT enough: a version downgrade or a
+# permission problem logs it too, and must never lead to a wipe.
+function datadir_corrupt() {
+    [[ -s "$mysqld_start_err" ]] || return 1
+    grep -q 'MY-012930' "$mysqld_start_err" &&
+        grep -qE 'MY-012237|MY-012224|Database page corruption' "$mysqld_start_err"
+}
+
+# wipe_corrupt_datadir empties /var/lib/mysql of a member whose InnoDB data is corrupt, so it starts
+# again as a new, empty member and is seeded by clone like any new member. A member that cannot start
+# otherwise blocks its whole data center: the bootstrap election waits for every member's answer.
+# The coordinator treats a member with an empty data directory as having nothing to lose.
+#
+# Only when another copy of the data is reachable: a peer of this data center that answers with
+# executed transactions, or (DC-DR) the active data center's primary (DCDR_SEED_HOST). Otherwise it
+# refuses and the member stays down for an operator.
+function wipe_corrupt_datadir() {
+    local h g copy=""
+    for h in "${member_hosts[@]}"; do
+        [[ "$h" == "$report_host" ]] && continue
+        g=$(timeout 10 ${mysql_header} --host="$h" -N -e "SELECT @@global.gtid_executed;" 2>/dev/null | tr -d '\n')
+        [[ -n "$g" ]] && { copy="$h (gtid_executed $g)"; break; }
+    done
+    if [[ -z "$copy" && -n "${DCDR_SEED_HOST:-}" && -n "${DCDR_PASSWORD:-}" ]]; then
+        g=$(MYSQL_PWD="$DCDR_PASSWORD" timeout 10 mysql -u "${DCDR_USER:-dcdr}" --port=3306 --host="$DCDR_SEED_HOST" -N -e "SELECT @@global.gtid_executed;" 2>/dev/null | tr -d '\n')
+        [[ -n "$g" ]] && copy="the active data center ${DCDR_SEED_HOST} (gtid_executed $g)"
+    fi
+    if [[ -z "$copy" ]]; then
+        log "ERROR" "InnoDB data is corrupt and no other copy is reachable (no peer answers, no active data center); NOT wiping, the member stays down"
+        return 1
+    fi
+    log "WARNING" "InnoDB data is corrupt; a copy is reachable on ${copy}. Wiping /var/lib/mysql so this member starts empty and is seeded by clone"
+    grep -E '\[ERROR\]' "$mysqld_start_err" | head -5 | while read -r l; do log "WARNING" "  last start: $l"; done
+    echo "$(timestamp) wiped corrupt datadir; copy on ${copy}" >> /scripts/datadir-wiped
+    find /var/lib/mysql -mindepth 1 -delete
+    return 0
+}
+
 function wait_for_mysqld_running() {
     local mysql="$mysql_header --host=$localhost"
     local max_restarts=60
     local restarts=0
+    local corrupt_starts=0
 
     while true; do
         if ! kill -0 "$pid" 2>/dev/null; then
+            if datadir_corrupt; then
+                corrupt_starts=$((corrupt_starts + 1))
+                log "ERROR" "mysqld failed to start: InnoDB data in /var/lib/mysql is corrupt ($corrupt_starts/$corrupt_starts_before_wipe)"
+                if (( corrupt_starts >= corrupt_starts_before_wipe )) && wipe_corrupt_datadir; then
+                    restarts=0
+                    corrupt_starts=0
+                    start_mysqld_in_background
+                    sleep 10
+                    continue
+                fi
+            else
+                corrupt_starts=0
+            fi
             if (( restarts >= max_restarts )); then
                 log "ERROR" "mysqld (pid=$pid) died and exceeded $max_restarts restart attempts. Aborting."
                 exit 1
@@ -372,6 +438,37 @@ function create_replication_user() {
         "
     fi
     touch /scripts/ready.txt
+}
+
+# create_dcdr_user creates (or refreshes the password of) the user that the passive data center
+# uses for its cross-DC replication channel and as the donor user of a cross-DC CLONE.
+# Everything runs with SQL_LOG_BIN=0 so no local GTID is written (an errant GTID would stop this
+# member from ever following the other data center).
+function create_dcdr_user() {
+    if [[ "${DCDR_ENABLED:-false}" != "true" ]]; then
+        return 0
+    fi
+    local user="${DCDR_USER:-dcdr}"
+    if [[ -z "${DCDR_PASSWORD:-}" ]]; then
+        log "ERROR" "DCDR_ENABLED=true but DCDR_PASSWORD is empty"
+        return 1
+    fi
+    log "INFO" "Ensuring DC-DR channel user '${user}'......"
+    local mysql="$mysql_header --host=$localhost"
+    retry 60 ${mysql} -N -e "
+        SET SQL_LOG_BIN=0;
+        SET GLOBAL super_read_only=OFF;
+        SET GLOBAL read_only=OFF;
+        CREATE USER IF NOT EXISTS '${user}'@'%' IDENTIFIED BY '${DCDR_PASSWORD}' REQUIRE SSL;
+        ALTER USER '${user}'@'%' IDENTIFIED BY '${DCDR_PASSWORD}' REQUIRE SSL;
+        GRANT REPLICATION SLAVE ON *.* TO '${user}'@'%';
+        GRANT BACKUP_ADMIN ON *.* TO '${user}'@'%';
+        GRANT SELECT ON performance_schema.replication_group_members TO '${user}'@'%';
+        FLUSH PRIVILEGES;
+        SET GLOBAL read_only=ON;
+        SET GLOBAL super_read_only=ON;
+        SET SQL_LOG_BIN=1;
+    "
 }
 
 function install_group_replication_plugin() {
@@ -533,6 +630,44 @@ function set_valid_donors() {
     fi
 }
 
+# start_group_replication runs START GROUP_REPLICATION with the usual retries. If this member's
+# group_replication_applier relay log is corrupt (MY-010596 / MY-013121, seen after an unclean
+# restart), the member never stays up: either START fails (ERROR 3092), or START returns OK and the
+# applier fails on the corrupt event a moment later and takes the member OFFLINE (lab, 2026-11-23).
+# So after every START it waits a few seconds and checks the error log, whatever START returned. On
+# corruption it discards the applier relay log once, clears the offline_mode GR set on the way out,
+# and starts again.
+#
+# Discarding it is safe: the relay log only holds transactions this member received but had not
+# applied yet. A joiner fetches whatever it lacks from a donor during distributed recovery. A
+# bootstrap candidate is the member with the most executed transactions, and in single-primary
+# mode the primary commits before the others apply, so a transaction no member has executed is
+# not committed anywhere either. The discarded set is logged.
+function start_group_replication() {
+    local mysql="$mysql_header --host=$localhost"
+    local since corrupt unapplied started=0
+    since=$(${mysql} -N -e "SELECT NOW(6);" 2>/dev/null)
+    ${mysql} -N -e "START GROUP_REPLICATION;" && started=1
+    corrupt=0
+    if [[ -n "$since" ]]; then
+        sleep 3
+        corrupt=$(${mysql} -N -e "SELECT COUNT(*) FROM performance_schema.error_log WHERE LOGGED >= '${since}' AND ERROR_CODE IN ('MY-010596','MY-013121') AND DATA LIKE '%group_replication_applier%';" 2>/dev/null || echo 0)
+    fi
+    if [[ "${corrupt:-0}" == "0" ]]; then
+        [[ $started == 1 ]] && return 0
+        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        return
+    fi
+    unapplied=$(${mysql} -N -e "SELECT GTID_SUBTRACT(RECEIVED_TRANSACTION_SET, @@global.gtid_executed) FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME='group_replication_applier';" 2>/dev/null | tr -d '\n')
+    log "WARNING" "group_replication_applier relay log is corrupt; discarding it (received but not applied: '${unapplied}')"
+    ${mysql} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null || true
+    if ! ${mysql} -N -e "RESET REPLICA FOR CHANNEL 'group_replication_applier';"; then
+        log "ERROR" "could not reset the group_replication_applier channel"
+    fi
+    ${mysql} -N -e "SET GLOBAL offline_mode=OFF;" 2>/dev/null || true
+    retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+}
+
 function bootstrap_cluster() {
     # for bootstrap group replication, the following steps have been taken:
     # - initially reset the member to cleanup all data configuration/set the binlog and gtid's initial position.
@@ -549,9 +684,23 @@ function bootstrap_cluster() {
     if [[ "$joining_for_first_time" == "1" ]]; then
         retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
     fi
+    keep_bootstrap_fenced
     retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+    start_group_replication
     retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
+}
+
+# keep_bootstrap_fenced (DC-DR) makes the member that bootstraps a group stay super_read_only after
+# Group Replication elects it primary. The member action that lifts the fence on election is group
+# configuration stored with the data, so a data center that was active before would come back
+# writable the moment its group starts, before the coordinator has checked that the other data
+# center holds nothing newer. The coordinator enables the action again once it opens the data
+# center (MySQL 8.0.26+; the action is changed locally while group replication is stopped).
+function keep_bootstrap_fenced() {
+    [[ "${DCDR_ENABLED:-false}" == "true" ]] || return 0
+    version_ge 8 1 || { [[ "$MYSQL_MAJOR" -eq 8 && "$MYSQL_MINOR" -eq 0 && "${MYSQL_PATCH%%[!0-9]*}" -ge 26 ]]; } || return 0
+    ${mysql_header} --host=$localhost -N -e "SELECT group_replication_disable_member_action('mysql_disable_super_read_only_if_primary', 'AFTER_PRIMARY_ELECTION');" >/dev/null ||
+        log "WARNING" "could not disable lifting super_read_only on primary election before the bootstrap"
 }
 
 function join_into_cluster() {
@@ -608,13 +757,15 @@ function join_into_cluster() {
     fi
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        drop_dcdr_channel
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        drop_dcdr_channel
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
@@ -661,6 +812,9 @@ function log_clone_progress() {
 # free and try again instead of giving up.
 function clone_from_donor() {
     local donor=$1
+    # DC-DR: a cross-DC clone uses the channel user instead of the group's repl user
+    local clone_user=${2:-repl}
+    local clone_password=${3:-$MYSQL_ROOT_PASSWORD}
     local mysql="$mysql_header --host=$localhost"
     local waited=0
 
@@ -668,7 +822,7 @@ function clone_from_donor() {
         log_clone_progress &
         local progress_pid=$!
 
-        error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' REQUIRE SSL;" 2>&1)
+        error_message=$(${mysql} -N -e "CLONE INSTANCE FROM '${clone_user}'@'$donor':3306 IDENTIFIED BY '${clone_password}' REQUIRE SSL;" 2>&1)
 
         kill "$progress_pid" 2>/dev/null
         wait "$progress_pid" 2>/dev/null
@@ -757,13 +911,15 @@ function join_by_clone() {
 
     # If the host is still alive, it will join the cluster directly.
     if [[ $mysqld_alive == 1 ]]; then
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        drop_dcdr_channel
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
     else
         #run mysqld in background since mysqld can't restart after a clone process
         start_mysqld_in_background
         wait_for_mysqld_running
-        retry 60 ${mysql} -N -e "START GROUP_REPLICATION;"
+        drop_dcdr_channel
+        start_group_replication
         log "INFO" "Host (${report_host}) has joined to the group......."
         #
     fi
@@ -771,16 +927,213 @@ function join_by_clone() {
     echo "end join in cluster"
 }
 
+# allow_clone_donor puts a cross-DC donor into clone_valid_donor_list. CLONE refuses any donor that is
+# not listed (error 3869); the list set by set_valid_donors only knows the members of this group.
+function allow_clone_donor() {
+    local mysql="$mysql_header --host=$localhost"
+    local list
+    list=$(${mysql} -N -e "SELECT @@GLOBAL.clone_valid_donor_list;" 2>/dev/null | tr -d '\n')
+    if [[ -n "$list" && "$list" != "NULL" ]]; then
+        list="${list},$1:3306"
+    else
+        list="$1:3306"
+    fi
+    retry 60 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='${list}';"
+}
+
+# drop_dcdr_channel removes the cross-DC replication channel from a member that is about to start
+# Group Replication as a SECONDARY. CLONE copies the donor's replication configuration, so a member
+# cloned from the passive data center's primary arrives with the dcdr channel, and Group Replication
+# refuses to start on a secondary while any asynchronous channel exists (error 3092 / "Can't start
+# group replication on secondary member with single-primary mode while asynchronous replication
+# channels are running"). The channel belongs on the group primary only; the coordinator creates it
+# there.
+function drop_dcdr_channel() {
+    if [[ "${DCDR_ENABLED:-false}" != "true" ]]; then
+        return 0
+    fi
+    local mysql="$mysql_header --host=$localhost"
+    if version_ge 8 4; then
+        ${mysql} -N -e "STOP REPLICA FOR CHANNEL 'dcdr'; RESET REPLICA ALL FOR CHANNEL 'dcdr';" 2>/dev/null || true
+    else
+        ${mysql} -N -e "STOP SLAVE FOR CHANNEL 'dcdr'; RESET SLAVE ALL FOR CHANNEL 'dcdr';" 2>/dev/null || true
+    fi
+}
+
+# refence puts the member back to read only after a failed seed. The seed lifts read only to allow the
+# clone; leaving it lifted would leave a member of the passive data center writable while its group is
+# down, which is exactly what the fence exists to prevent.
+function refence() {
+    local mysql="$mysql_header --host=$localhost"
+    ${mysql} -N -e "SET GLOBAL super_read_only=ON; SET GLOBAL read_only=ON;" 2>/dev/null || true
+}
+
+# wait_for_mysqld_exit waits for the mysqld child to go away after a successful CLONE (mysqld is not
+# supervised, so the clone shuts it down). Returns 0 once mysqld is gone, 1 if it is still alive.
+function wait_for_mysqld_exit() {
+    local i
+    for i in {60..0}; do
+        if ! kill -0 $pid 2>/dev/null; then
+            return 0
+        fi
+        log "INFO" "Attempt $i: waiting for mysqld(process id=$pid) to exit after clone"
+        sleep 1
+    done
+    return 1
+}
+
+# seed_by_clone_then_create_cluster seeds the FIRST member of a passive data center. It clones the
+# active data center's primary (DCDR_SEED_HOST) and then bootstraps this data center's OWN group
+# from the cloned data, under this DC's own group name. The other members of the passive DC then
+# join the new group by the normal join_by_clone path.
+#
+# The donor is /scripts/dcdr-donor when the coordinator wrote it (a brand new member of the ACTIVE
+# data center while another data center's primary holds the data), else DCDR_SEED_HOST.
+function seed_by_clone_then_create_cluster() {
+    local mysql="$mysql_header --host=$localhost"
+    local donor
+    donor=$(cat /scripts/dcdr-donor 2>/dev/null || true)
+    donor=${donor:-${DCDR_SEED_HOST:-}}
+    if [[ -z "$donor" ]]; then
+        log "ERROR" "no donor (/scripts/dcdr-donor and DCDR_SEED_HOST are empty); cannot seed from another data center"
+        return 1
+    fi
+    log "INFO" "Seeding ${report_host} by clone from ${donor}......"
+    allow_clone_donor "${donor}"
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+    retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
+    if ! clone_from_donor "${donor}" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
+        refence
+        log "ERROR" "Clone from ${donor} failed; refusing to bootstrap an empty group. The coordinator will retry."
+        return 1
+    fi
+    rm -f /scripts/dcdr-donor
+    wait_for_mysqld_exit || { log "ERROR" "mysqld did not exit after clone"; return 1; }
+    start_mysqld_in_background
+    wait_for_mysqld_running
+    # the cloned GTIDs are the data: they must not be reset again
+    joining_for_first_time=0
+    bootstrap_cluster
+    log "INFO" "${report_host} bootstrapped its own group from the active data center's data"
+}
+
+# reseed_from_donor re-seeds THIS member from a donor: it leaves the group, clones the donor and
+# restarts mysqld, and leaves group replication stopped. The coordinator decides what comes next
+# (create_cluster on the designated member, join_by_clone on the others). The donor is read from
+# /scripts/dcdr-donor if present, else DCDR_SEED_HOST. CLONE is refused on a running group
+# member (error 3875), hence the STOP GROUP_REPLICATION.
+function reseed_from_donor() {
+    local mysql="$mysql_header --host=$localhost"
+    local donor
+    donor=$(cat /scripts/dcdr-donor 2>/dev/null || true)
+    donor=${donor:-${DCDR_SEED_HOST:-}}
+    if [[ -z "$donor" ]]; then
+        log "ERROR" "no donor for reseed (/scripts/dcdr-donor and DCDR_SEED_HOST are empty)"
+        return 1
+    fi
+    rm -f /scripts/dcdr-donor
+    log "INFO" "Re-seeding ${report_host} from ${donor}......"
+    ${mysql} -N -e "STOP GROUP_REPLICATION;" 2>/dev/null || true
+    allow_clone_donor "$donor"
+    retry 60 ${mysql} -N -e "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+    retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
+    if ! clone_from_donor "$donor" "${DCDR_USER:-dcdr}" "${DCDR_PASSWORD}"; then
+        refence
+        log "ERROR" "Re-seed clone from ${donor} failed"
+        return 1
+    fi
+    wait_for_mysqld_exit || { log "ERROR" "mysqld did not exit after clone"; return 1; }
+    start_mysqld_in_background
+    wait_for_mysqld_running
+    joining_for_first_time=0
+    log "INFO" "${report_host} re-seeded from ${donor}; group replication left stopped"
+}
+
+# dcdr_reseed_if_requested (DC-DR automatic re-seed) runs when the coordinator wrote
+# /scripts/dcdr-reseed-request: this member of a passive data center diverged from the active one
+# and the database opted in (DC_DR_AUTO_RESEED). The request names the errant transactions (first
+# line) and the binary log files that hold them (one per line after it). Those files are kept,
+# compressed, under /var/lib/mysql/.dcdr-reseed/<time>/ with the errant set: a hidden directory
+# survives the wipe and the next initialize. They can be replayed with
+#   mysqlbinlog --include-gtids=<errant set> <files> | mysql ...
+# Everything else in the data directory is deleted and the container exits, so it starts again on
+# an empty data directory and is seeded from the active data center like a brand new member.
+function dcdr_reseed_if_requested() {
+    [[ -f /scripts/dcdr-reseed-request ]] || return 0
+    local errant ts dir f saved=0
+    errant=$(head -1 /scripts/dcdr-reseed-request | tr -d '\n')
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+        ${mysql_header} --host=$localhost -N -e "SHUTDOWN;" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    dir=/var/lib/mysql/.dcdr-reseed/$ts
+    mkdir -p "$dir"
+    echo "$errant" >"$dir/errant.gtids"
+    for f in $(tail -n +2 /scripts/dcdr-reseed-request); do
+        f=$(basename "$f")
+        if [[ -f "/var/lib/mysql/$f" ]] && gzip -c "/var/lib/mysql/$f" >"$dir/$f.gz"; then
+            saved=$((saved + 1))
+        else
+            log "ERROR" "DC-DR re-seed: could not save the binary log $f"
+        fi
+    done
+    log "WARNING" "DC-DR AUTOMATIC RE-SEED: errant transactions ${errant}; ${saved} binary log file(s) holding them saved in $dir; wiping the data directory"
+    find /var/lib/mysql -mindepth 1 -maxdepth 1 ! -name .dcdr-reseed -exec rm -rf {} +
+    echo "$(date -u +%FT%TZ) re-seeded; errant ${errant}; saved in $dir" >>/scripts/dcdr-reseeded
+    rm -f /scripts/dcdr-reseed-request
+    log "INFO" "data directory wiped; starting again on the empty data directory"
+    # exec, not exit: under tini -g the container did not end when this script exited (lab 2026-11-24, it
+    # stayed up with no mysqld), so this script starts itself again in place, like a fresh container
+    exec "$0" "$@"
+}
+
 export pid
+# refresh_peers re-reads /scripts/peer-list, which the coordinator rewrites when the data center
+# grows (DC-DR scale up of a group that started with 1 member), and updates the hosts, the seeds
+# and group_replication_group_seeds. Without it a member that started alone keeps itself as its
+# only seed and peer after a mysqld restart.
+function refresh_peers() {
+    local h
+    h=$(cat /scripts/peer-list 2>/dev/null)
+    [[ -n "$h" ]] || return 0
+    IFS=', ' read -r -a peers <<<"$h"
+    export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
+    export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
+    member_hosts=($(echo -n ${peers[*]} | tr -d '[]'))
+    log "INFO" "peers: ${member_hosts[*]}"
+    ${mysql_header} --host=$localhost -N -e "SET GLOBAL group_replication_group_seeds='${seeds}';" ||
+        log "WARNING" "could not set group_replication_group_seeds to ${seeds}"
+}
+
 function start_mysqld_in_background() {
     # Docker Hub based images ship docker-entrypoint.sh; Oracle Container Registry images (MySQL Enterprise) ship /entrypoint.sh.
     entrypoint=$(command -v docker-entrypoint.sh || echo /entrypoint.sh)
-    log "INFO" "Starting mysql server with '$entrypoint mysqld $args'..."
-    "$entrypoint" mysqld $args &
+    local fence_args=""
+    # An already initialized data directory means this is a restart (pod restart, or mysqld restarted in place
+    # after a crash). Boot fenced: until Group Replication elects this member primary it must not accept a
+    # single write, or the write becomes an errant GTID outside the group (split-brain, seen in DC-DR test T5).
+    # Also keep async channels stopped on boot; the coordinator starts the right channel against the right source.
+    # Not on the very first boot: --initialize and the entrypoint's init SQL need a writable server.
+    if [[ -d /var/lib/mysql/mysql ]]; then
+        fence_args="--super-read-only=ON"
+        if version_ge 8 1 || { [[ "$MYSQL_MAJOR" -eq 8 && "$MYSQL_MINOR" -eq 0 && "${MYSQL_PATCH%%[!0-9]*}" -ge 26 ]]; }; then
+            fence_args="$fence_args --skip-replica-start=ON"
+        else
+            fence_args="$fence_args --skip-slave-start"
+        fi
+    fi
+    log "INFO" "Starting mysql server with '$entrypoint mysqld $args $fence_args'..."
+    # stderr also goes to $mysqld_start_err (truncated per start), so a failed start can be diagnosed.
+    # Without MYSQL_PWD: on an empty data directory (first boot, or after wipe_corrupt_datadir) the
+    # entrypoint runs its init SQL as root with no password yet, and an inherited MYSQL_PWD (exported
+    # below, after the first start) fails it with "Access denied" and the entrypoint exits.
+    env -u MYSQL_PWD "$entrypoint" mysqld $args $fence_args 2> >(tee "$mysqld_start_err" >&2) &
     pid=$!
     log "INFO" "The process id of mysqld is '$pid'"
 }
 
+dcdr_reseed_if_requested
 start_mysqld_in_background
 
 # create mysql client with user exported in mysql_header and export password
@@ -797,6 +1150,9 @@ wait_for_mysqld_running
 # ensure replication user
 create_replication_user
 
+# DC-DR: ensure the cross-DC channel user
+create_dcdr_user
+
 # ensure replication plugin
 install_group_replication_plugin
 
@@ -804,6 +1160,13 @@ install_group_replication_plugin
 install_clone_plugin
 
 while true; do
+    # DC-DR re-seed: while the coordinator holds /scripts/dcdr-pause, this script must neither
+    # restart mysqld nor start group replication.
+    while [ -f "/scripts/dcdr-pause" ]; do
+        log "INFO" "/scripts/dcdr-pause is present; holding"
+        sleep 2
+    done
+    dcdr_reseed_if_requested
     echo "running">/scripts/setup.txt
     log "INFO" "creating setup.txt file"
     kill -0 $pid
@@ -823,6 +1186,7 @@ while true; do
     done
     desired_func=$(cat /scripts/signal.txt)
     rm -rf /scripts/signal.txt
+    refresh_peers
     log "INFO" "going to execute $desired_func"
     if [[ $desired_func == "create_cluster" ]]; then
         bootstrap_cluster
@@ -833,6 +1197,18 @@ while true; do
         wait_for_primary "${member_hosts[*]}"
         set_valid_donors
         join_into_cluster
+    fi
+    if [[ $desired_func == "seed_by_clone_then_create_cluster" ]]; then
+        if ! seed_by_clone_then_create_cluster; then
+            # mysqld keeps running (empty, fenced), so "wait $pid" below would never return and the
+            # coordinator's next seed signal would never be read: go back to waiting for a signal.
+            rm -rf /scripts/setup.txt
+            sleep 5
+            continue
+        fi
+    fi
+    if [[ $desired_func == "reseed_from_donor" ]]; then
+        reseed_from_donor
     fi
     if [[ $desired_func == "join_by_clone" ]]; then
         check_member_list_updated "${member_hosts[*]}"
