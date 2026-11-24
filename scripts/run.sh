@@ -684,9 +684,23 @@ function bootstrap_cluster() {
     if [[ "$joining_for_first_time" == "1" ]]; then
         retry 60 ${mysql} -N -e "$(reset_binlog_and_gtids_sql)"
     fi
+    keep_bootstrap_fenced
     retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
     start_group_replication
     retry 60 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
+}
+
+# keep_bootstrap_fenced (DC-DR) makes the member that bootstraps a group stay super_read_only after
+# Group Replication elects it primary. The member action that lifts the fence on election is group
+# configuration stored with the data, so a data center that was active before would come back
+# writable the moment its group starts, before the coordinator has checked that the other data
+# center holds nothing newer. The coordinator enables the action again once it opens the data
+# center (MySQL 8.0.26+; the action is changed locally while group replication is stopped).
+function keep_bootstrap_fenced() {
+    [[ "${DCDR_ENABLED:-false}" == "true" ]] || return 0
+    version_ge 8 1 || { [[ "$MYSQL_MAJOR" -eq 8 && "$MYSQL_MINOR" -eq 0 && "${MYSQL_PATCH%%[!0-9]*}" -ge 26 ]]; } || return 0
+    ${mysql_header} --host=$localhost -N -e "SELECT group_replication_disable_member_action('mysql_disable_super_read_only_if_primary', 'AFTER_PRIMARY_ELECTION');" >/dev/null ||
+        log "WARNING" "could not disable lifting super_read_only on primary election before the bootstrap"
 }
 
 function join_into_cluster() {
