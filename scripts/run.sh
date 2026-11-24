@@ -1049,6 +1049,43 @@ function reseed_from_donor() {
     log "INFO" "${report_host} re-seeded from ${donor}; group replication left stopped"
 }
 
+# dcdr_reseed_if_requested (DC-DR automatic re-seed) runs when the coordinator wrote
+# /scripts/dcdr-reseed-request: this member of a passive data center diverged from the active one
+# and the database opted in (DC_DR_AUTO_RESEED). The request names the errant transactions (first
+# line) and the binary log files that hold them (one per line after it). Those files are kept,
+# compressed, under /var/lib/mysql/.dcdr-reseed/<time>/ with the errant set: a hidden directory
+# survives the wipe and the next initialize. They can be replayed with
+#   mysqlbinlog --include-gtids=<errant set> <files> | mysql ...
+# Everything else in the data directory is deleted and the container exits, so it starts again on
+# an empty data directory and is seeded from the active data center like a brand new member.
+function dcdr_reseed_if_requested() {
+    [[ -f /scripts/dcdr-reseed-request ]] || return 0
+    local errant ts dir f saved=0
+    errant=$(head -1 /scripts/dcdr-reseed-request | tr -d '\n')
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+        ${mysql_header} --host=$localhost -N -e "SHUTDOWN;" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    dir=/var/lib/mysql/.dcdr-reseed/$ts
+    mkdir -p "$dir"
+    echo "$errant" >"$dir/errant.gtids"
+    for f in $(tail -n +2 /scripts/dcdr-reseed-request); do
+        f=$(basename "$f")
+        if [[ -f "/var/lib/mysql/$f" ]] && gzip -c "/var/lib/mysql/$f" >"$dir/$f.gz"; then
+            saved=$((saved + 1))
+        else
+            log "ERROR" "DC-DR re-seed: could not save the binary log $f"
+        fi
+    done
+    log "WARNING" "DC-DR AUTOMATIC RE-SEED: errant transactions ${errant}; ${saved} binary log file(s) holding them saved in $dir; wiping the data directory"
+    find /var/lib/mysql -mindepth 1 -maxdepth 1 ! -name .dcdr-reseed -exec rm -rf {} +
+    echo "$(date -u +%FT%TZ) re-seeded; errant ${errant}; saved in $dir" >>/scripts/dcdr-reseeded
+    rm -f /scripts/dcdr-reseed-request
+    log "INFO" "data directory wiped; restarting the container on an empty data directory"
+    exit 1
+}
+
 export pid
 # refresh_peers re-reads /scripts/peer-list, which the coordinator rewrites when the data center
 # grows (DC-DR scale up of a group that started with 1 member), and updates the hosts, the seeds
@@ -1094,6 +1131,7 @@ function start_mysqld_in_background() {
     log "INFO" "The process id of mysqld is '$pid'"
 }
 
+dcdr_reseed_if_requested
 start_mysqld_in_background
 
 # create mysql client with user exported in mysql_header and export password
@@ -1126,6 +1164,7 @@ while true; do
         log "INFO" "/scripts/dcdr-pause is present; holding"
         sleep 2
     done
+    dcdr_reseed_if_requested
     echo "running">/scripts/setup.txt
     log "INFO" "creating setup.txt file"
     kill -0 $pid
