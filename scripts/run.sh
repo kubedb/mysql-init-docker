@@ -1082,8 +1082,10 @@ function dcdr_reseed_if_requested() {
     find /var/lib/mysql -mindepth 1 -maxdepth 1 ! -name .dcdr-reseed -exec rm -rf {} +
     echo "$(date -u +%FT%TZ) re-seeded; errant ${errant}; saved in $dir" >>/scripts/dcdr-reseeded
     rm -f /scripts/dcdr-reseed-request
-    log "INFO" "data directory wiped; restarting the container on an empty data directory"
-    exit 1
+    log "INFO" "data directory wiped; starting again on the empty data directory"
+    # exec, not exit: under tini -g the container did not end when this script exited (lab 2026-11-24, it
+    # stayed up with no mysqld), so this script starts itself again in place, like a fresh container
+    exec "$0" "$@"
 }
 
 export pid
