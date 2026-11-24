@@ -1199,7 +1199,13 @@ while true; do
         join_into_cluster
     fi
     if [[ $desired_func == "seed_by_clone_then_create_cluster" ]]; then
-        seed_by_clone_then_create_cluster
+        if ! seed_by_clone_then_create_cluster; then
+            # mysqld keeps running (empty, fenced), so "wait $pid" below would never return and the
+            # coordinator's next seed signal would never be read: go back to waiting for a signal.
+            rm -rf /scripts/setup.txt
+            sleep 5
+            continue
+        fi
     fi
     if [[ $desired_func == "reseed_from_donor" ]]; then
         reseed_from_donor
